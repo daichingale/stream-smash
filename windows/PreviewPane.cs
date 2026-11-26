@@ -18,6 +18,8 @@ sealed class PreviewPane : Panel
     readonly ComboBox quality = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 92 };
     readonly Label state = new Label { Text = "入力を選び、プレビュー開始を押してください。", Dock = DockStyle.Bottom, Height = 30 };
     Form floating;
+    Form sharing;
+    PictureBox sharePicture;
     PreviewFeed feed;
     Bitmap frame;
     readonly Stopwatch displayClock = new Stopwatch();
@@ -91,6 +93,32 @@ sealed class PreviewPane : Panel
         floating.Show(FindForm());
     }
 
+    public void ShowShareWindow()
+    {
+        if (sharing != null) {
+            if (sharing.WindowState == FormWindowState.Minimized) sharing.WindowState = FormWindowState.Normal;
+            sharing.Activate();
+            return;
+        }
+        sharing = new Form {
+            Text = "Stream Smash - 画面共有",
+            ClientSize = new Size(960, 540), MinimumSize = new Size(320, 200),
+            StartPosition = FormStartPosition.CenterScreen, ShowInTaskbar = true
+        };
+        sharePicture = new PictureBox {
+            Dock = DockStyle.Fill, BackColor = Color.Black, SizeMode = PictureBoxSizeMode.Zoom,
+            Image = picture.Image
+        };
+        sharing.Controls.Add(sharePicture);
+        sharing.FormClosed += (sender, args) => {
+            sharePicture.Image = null;
+            sharePicture = null;
+            sharing = null;
+        };
+        // Expose an independent window to the screen-sharing picker.
+        sharing.Show();
+    }
+
     public void Begin()
     {
         End();
@@ -118,7 +146,7 @@ sealed class PreviewPane : Panel
 
     void ReadFrame()
     {
-        if (feed == null || !picture.Visible) return;
+        if (feed == null || (!picture.Visible && sharePicture == null)) return;
         if (feed.ReadLatest(frame)) {
             if (picture.Image == null) {
                 picture.Image = frame;
@@ -126,6 +154,10 @@ sealed class PreviewPane : Panel
                 displayClock.Start();
             }
             picture.Invalidate();
+            if (sharePicture != null) {
+                if (sharePicture.Image == null) sharePicture.Image = frame;
+                sharePicture.Invalidate();
+            }
             displayed++;
         }
         if (feed.Disconnected) {
@@ -142,6 +174,7 @@ sealed class PreviewPane : Panel
         if (feed != null) feed.Dispose();
         feed = null;
         picture.Image = null;
+        if (sharePicture != null) sharePicture.Image = null;
         if (frame != null) frame.Dispose();
         frame = null;
         state.Text = "入力を選び、プレビュー開始を押してください。";
@@ -152,6 +185,7 @@ sealed class PreviewPane : Panel
         if (disposing) {
             End();
             if (floating != null) floating.Close();
+            if (sharing != null) sharing.Close();
         }
         base.Dispose(disposing);
     }

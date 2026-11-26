@@ -41,11 +41,18 @@ sealed class StreamSmashWindow : Form
     readonly Button clearOverlay = new Button { Text = "解除", AutoSize = true };
     readonly NumericUpDown opacity = new NumericUpDown { Minimum = 0, Maximum = 100, Value = 100 };
     readonly PreviewPane preview = new PreviewPane();
+    readonly Button shareWindow = new Button { Text = "画面共有ウィンドウ", AutoSize = true };
+    readonly Label resourceUsage = new Label {
+        Text = "Stream Smash の CPU・メモリを計測中…", AutoSize = true,
+        Padding = new Padding(9, 5, 9, 5), BackColor = StudioColors.Panel
+    };
     readonly Label status = new Label { Text = "準備完了", AutoSize = true, Margin = new Padding(3, 5, 3, 5) };
     readonly Label clipStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
     readonly Label encoderStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
     readonly TextBox activity = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill };
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 50 };
+    readonly System.Windows.Forms.Timer resourceTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+    readonly ProcessUsage usage = new ProcessUsage(Process.GetCurrentProcess().Id);
     readonly ConcurrentQueue<string> messages = new ConcurrentQueue<string>();
     static readonly Regex Progress = new Regex(@"^(\S+) \| frames (\d+) \| encoder dropped (\d+) \| duplicated (\d+) \| RTMP retries (\d+)(?: \| fps (\S+) \| speed (\S+))?$");
     Process engine;
@@ -91,6 +98,7 @@ sealed class StreamSmashWindow : Form
         AddField(overlayControls, 1, "不透明度 (%)", opacity);
         AddWide(overlayControls, 2, Actions(chooseOverlay, clearOverlay));
         right.Controls.Add(overlayControls, 0, 1);
+        right.Controls.Add(Actions(shareWindow, resourceUsage), 0, 2);
         columns.Panel2.Controls.Add(right);
         var shell = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
         shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
@@ -172,6 +180,7 @@ sealed class StreamSmashWindow : Form
             } else StartCapture(false);
         };
         previewButton.Click += (sender, args) => StartCapture(true);
+        shareWindow.Click += (sender, args) => OpenShareWindow();
         stop.Click += (sender, args) => StopRecording();
         save.Click += (sender, args) => SaveHighlight();
         openClip.Click += (sender, args) => {
@@ -191,13 +200,36 @@ sealed class StreamSmashWindow : Form
             recordAfterPreview = false;
             StopRecording();
         };
-        FormClosed += (sender, args) => timer.Dispose();
+        FormClosed += (sender, args) => { timer.Dispose(); resourceTimer.Dispose(); };
         timer.Tick += (sender, args) => ReadActivity();
         StudioColors.Apply(this);
         title.ForeColor = StudioColors.Accent;
         StudioColors.Primary(start);
         UpdateControls();
         timer.Start();
+        resourceTimer.Tick += (sender, args) => UpdateUsage();
+        UpdateUsage();
+        resourceTimer.Start();
+    }
+
+    void UpdateUsage()
+    {
+        var sample = usage.Sample();
+        if (sample.ProcessCount == 0) {
+            resourceUsage.Text = "CPU・メモリを取得できません";
+            return;
+        }
+        string cpu = sample.CpuPercent.HasValue ? sample.CpuPercent.Value.ToString("F1") + "%" : "計測中";
+        resourceUsage.Text = string.Format("CPU {0}   メモリ {1:F0} MiB   （{2} プロセス）",
+            cpu, sample.WorkingSet / 1048576.0, sample.ProcessCount);
+    }
+
+    void OpenShareWindow()
+    {
+        preview.ShowShareWindow();
+        if (engine == null) StartCapture(true);
+        else if (recording && !livePreview.Checked)
+            status.Text = "現在の録画では映像表示がオフです。次回の開始前にオンにしてください。";
     }
 
     static void AddField(TableLayoutPanel table, int row, string label, Control field)
