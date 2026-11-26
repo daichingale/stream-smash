@@ -6,7 +6,9 @@ OBSを経由せず、ゲーム映像の録画と配信を行うオープンソ�
 
 DirectShow・libx264対応の [FFmpeg](https://ffmpeg.org/download.html#build-windows) が必要です。FFmpegはPATHに入れるか、`STREAM_SMASH_FFMPEG` に絶対パスを指定してください。
 
-配布ZIPを展開し、`StreamSmash.exe` を開きます。同じフォルダの `stream-smash.exe` が録画エンジンです。ソースからビルドする場合は [Rust](https://rustup.rs/) を用意し、リポジトリのルートで `build-windows.cmd` を実行して `target\release\StreamSmash.exe` を開きます。
+[GitHubのソース一式をZIPで取得](https://github.com/daichingale/stream-smash/archive/refs/heads/main.zip) またはクローンし、ルートにある `StreamSmash.exe` を開きます。Windows x64用のビルド済みアプリと、同じフォルダに必要な録画エンジン `stream-smash.exe` が入っています。録画エンジンを直接使う場合は `stream-smash.exe --help` でコマンドを確認できます。
+
+コードを変更してビルドする場合は [Rust](https://rustup.rs/) を用意し、ルートで `build-windows.cmd` を実行します。ビルドし直したアプリとエンジンは `target\release` に出力されます。
 
 - **テスト映像・音声** で録画を試せます。**キャプチャー機器** を選ぶと接続機器を検索し、映像機器・音声機器の候補を表示します。必要に応じて機器名を直接入力し、機器が対応する解像度とfpsを選んでください。
 - **配信 URL** を入力すると、MKV録画と配信が同時に始まります。空欄の場合は録画だけを行います。
