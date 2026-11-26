@@ -1,3 +1,4 @@
+mod highlight;
 mod session;
 mod stream;
 
@@ -19,7 +20,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         None | Some("--help" | "-h") => print_help(),
-        Some("devices") if args.len() == 0 => session::list_devices()?,
+        Some("devices") => {
+            let names_only = match args.next().as_deref() {
+                None => false,
+                Some("--names") if args.len() == 0 => true,
+                _ => return Err("Use devices or devices --names".into()),
+            };
+            session::list_devices(names_only)?;
+        }
         Some("record") => {
             let mut session = Session::default();
             let mut input = None;
@@ -59,6 +67,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                         session.stream = true;
                         None
                     }
+                    "--highlights" => {
+                        session.highlight_seconds = Some(value()?.parse()?);
+                        None
+                    }
+                    "--audio-peaks" => {
+                        session.audio_peaks = true;
+                        None
+                    }
                     _ => {
                         return Err(
                             format!("Unknown option {flag}. See stream-smash --help.").into()
@@ -92,8 +108,10 @@ fn print_help() {
          record --video-device NAME     Record a Windows capture device\n\
          record --input FILE            Record a media file at playback speed\n\n\
          Options: --audio-device NAME, --size WIDTHxHEIGHT, --fps N,\n\
-                  --seconds N, --output-dir PATH, --stream\n\
+                  --seconds N, --output-dir PATH, --stream, --highlights 10|30|60\n\
          --stream also sends RTMP(S) to STREAM_SMASH_RTMP_URL.\n\
+         With highlights enabled, press h then Enter to save recent footage.\n\
+         --audio-peaks also saves highlights when the audio suddenly gets louder.\n\
          Press q then Enter to stop and finalize the recording."
     );
 }

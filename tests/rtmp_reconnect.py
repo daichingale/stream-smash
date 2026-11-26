@@ -91,9 +91,9 @@ try:
     time.sleep(.4)
     sender = subprocess.Popen([
         str(exe), "record", "--test-pattern", "--size", "320x180", "--fps", "30",
-        "--seconds", "15", "--stream", "--output-dir", str(root)
+        "--seconds", "15", "--stream", "--highlights", "10", "--output-dir", str(root)
     ], env={**os.environ, "STREAM_SMASH_RTMP_URL": url},
-       stdout=sender_log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
+       stdout=sender_log, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, text=True)
     wait_received(first, "before-drop.flv")
     with proxy_lock:
         upstream = None
@@ -104,6 +104,8 @@ try:
                 pass
             conn.close()
     stop(first)
+    sender.stdin.write("h\n")
+    sender.stdin.flush()
     time.sleep(1.5)
     second = receiver("after-drop.flv")
     wait_received(second, "after-drop.flv")
@@ -112,7 +114,10 @@ try:
     log = sender_log.read()
     assert sender.returncode == 0 and url not in log, log
     assert "RTMP output stopped; retrying" in log, log
-    recording, = root.glob("*.mkv")
+    assert "Highlight saved:" in log, log
+    clip, = root.glob("*-Highlight-*.mkv")
+    assert clip.stat().st_size > 4000
+    recording, = (file for file in root.glob("*.mkv") if "-Highlight-" not in file.name)
     result = subprocess.check_output([
         "ffprobe", "-v", "error", "-count_frames", "-show_entries",
         "stream=codec_type,nb_read_frames:format=duration", "-of", "json", str(recording)

@@ -2,7 +2,7 @@ use std::{
     env,
     error::Error,
     fs,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     net::UdpSocket,
     path::PathBuf,
     process::{self, Command, Stdio},
@@ -11,7 +11,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::stream;
+use crate::{
+    highlight::{AudioPeaks, Highlights, Request},
+    stream,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -28,6 +31,8 @@ pub struct Session {
     pub fps: u16,
     pub seconds: Option<u64>,
     pub stream: bool,
+    pub highlight_seconds: Option<u16>,
+    pub audio_peaks: bool,
 }
 
 impl Default for Session {
@@ -39,6 +44,8 @@ impl Default for Session {
             fps: 60,
             seconds: None,
             stream: false,
+            highlight_seconds: None,
+            audio_peaks: false,
         }
     }
 }
@@ -55,6 +62,9 @@ impl Session {
         }
         if !(1..=120).contains(&self.fps) || self.seconds == Some(0) {
             return Err("Use 1–120 fps and a positive duration".into());
+        }
+        if self.audio_peaks && self.highlight_seconds.is_none() {
+            return Err("--audio-peaks requires --highlights".into());
         }
         let url = if self.stream {
             let url = env::var("STREAM_SMASH_RTMP_URL")
@@ -75,6 +85,9 @@ impl Session {
             "pipe:1",
         ]);
         self.add_input(&mut command)?;
+        if self.audio_peaks {
+            command.args(["-af", AudioPeaks::FILTER]);
+        }
         if let Some(seconds) = self.seconds {
             command.args(["-t", &seconds.to_string()]);
         }
@@ -119,20 +132,33 @@ impl Session {
         fs::create_dir_all(&self.output_dir)?;
         let output_dir = self.output_dir.canonicalize()?;
         let path = output_dir.join(&name);
+        let highlights = self
+            .highlight_seconds
+            .map(|seconds| Highlights::new(&output_dir, &name, seconds))
+            .transpose()?;
         let relay = if let Some(url) = url {
             let address = UdpSocket::bind("127.0.0.1:0")?.local_addr()?;
-            let output = format!(
-                "[f=matroska:onfail=abort]{name}|\
-                 [f=mpegts:onfail=ignore:bsfs/v=h264_mp4toannexb]udp://{address}?pkt_size=1316"
-            );
-            command.args(["-f", "tee", &output]);
             Some((address, url))
         } else {
-            command.arg(&name);
             None
         };
+        if relay.is_some() || highlights.is_some() {
+            let mut output = format!("[f=matroska:onfail=abort]{name}");
+            if let Some((address, _)) = relay {
+                output.push_str(&format!(
+                    "|[f=mpegts:onfail=ignore:bsfs/v=h264_mp4toannexb]udp://{address}?pkt_size=1316"
+                ));
+            }
+            if let Some(ref highlights) = highlights {
+                output.push_str(&highlights.output());
+            }
+            command.args(["-f", "tee", &output]);
+        } else {
+            command.arg(&name);
+        }
         command
             .current_dir(&output_dir)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command
@@ -144,14 +170,52 @@ impl Session {
         }
         let stderr = child.stderr.take().expect("piped diagnostics");
         let stdout = child.stdout.take().expect("piped progress");
+        let mut stdin = child.stdin.take().expect("piped controls");
+        let (save, requests) = std::sync::mpsc::sync_channel(4);
+        let manual = save.clone();
+        let can_save = highlights.is_some();
+        thread::spawn(move || {
+            for line in io::stdin()
+                .lock()
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
+                match line.trim() {
+                    "q" => {
+                        let _ = stdin.write_all(b"q\n");
+                        break;
+                    }
+                    "h" if can_save => {
+                        if manual.try_send(Request::Manual).is_err() {
+                            eprintln!("Highlight unavailable: request queue is full.");
+                        }
+                    }
+                    "h" => eprintln!("Start recording with --highlights to save a highlight."),
+                    _ => {}
+                }
+            }
+        });
         let retries = AtomicU64::new(0);
         let done = AtomicBool::new(false);
+        let finalized = AtomicBool::new(false);
         let result = thread::scope(|scope| {
-            scope.spawn(|| {
+            let diagnostics = scope.spawn(|| {
+                let mut peaks = AudioPeaks::default();
                 for line in BufReader::new(stderr)
                     .lines()
                     .map_while(std::result::Result::ok)
                 {
+                    if self.audio_peaks {
+                        if let Some(level) = line.strip_prefix("lavfi.astats.Overall.RMS_level=") {
+                            if level.parse().is_ok_and(|level| peaks.update(level)) {
+                                let _ = save.try_send(Request::AudioPeak);
+                            }
+                            continue;
+                        }
+                        if line.starts_with("frame:") && line.contains("pts_time:") {
+                            continue;
+                        }
+                    }
                     eprintln!("{line}");
                 }
             });
@@ -159,8 +223,18 @@ impl Session {
             if let Some((address, url)) = relay.as_ref() {
                 scope.spawn(|| stream::relay(*address, url, &done, &retries));
             }
+            if let Some(ref highlights) = highlights {
+                let done = &done;
+                let finalized = &finalized;
+                scope.spawn(move || highlights.run(requests, done, finalized));
+            }
             let result = child.wait();
-            done.store(true, Ordering::Relaxed);
+            diagnostics.join().expect("diagnostics thread");
+            finalized.store(
+                result.as_ref().is_ok_and(|status| status.success()),
+                Ordering::Relaxed,
+            );
+            done.store(true, Ordering::Release);
             result
         })?;
         if !result.success() {
@@ -244,7 +318,7 @@ impl Session {
     }
 }
 
-pub fn list_devices() -> Result<()> {
+pub fn list_devices(names_only: bool) -> Result<()> {
     if !cfg!(windows) {
         return Err("Device listing is available on Windows".into());
     }
@@ -261,11 +335,42 @@ pub fn list_devices() -> Result<()> {
         ])
         .output()?;
     let listing = String::from_utf8_lossy(&output.stderr);
-    if !listing.contains("(video)") && !listing.contains("(audio)") {
+    let names = capture_names(&listing);
+    if names.is_empty() {
         return Err(format!("No DirectShow devices found.\n{listing}").into());
     }
-    eprint!("{listing}");
+    if names_only {
+        for (kind, name) in names {
+            println!("{kind}\t{name}");
+        }
+    } else {
+        eprint!("{listing}");
+    }
     Ok(())
+}
+
+fn capture_names(listing: &str) -> Vec<(&'static str, &str)> {
+    let mut names = Vec::new();
+    for line in listing.lines() {
+        let Some((_, message)) = line.split_once("] ") else {
+            continue;
+        };
+        let Some(quoted) = message.strip_prefix('"') else {
+            continue;
+        };
+        let Some((name, kind)) = quoted.rsplit_once("\" (") else {
+            continue;
+        };
+        let kind = match kind {
+            "video)" => "video",
+            "audio)" => "audio",
+            _ => continue,
+        };
+        if !name.contains(['\t', '\r', '\n']) && !names.contains(&(kind, name)) {
+            names.push((kind, name));
+        }
+    }
+    names
 }
 
 pub fn ffmpeg() -> Command {
