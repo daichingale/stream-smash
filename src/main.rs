@@ -1,10 +1,11 @@
 mod highlight;
 mod session;
 mod stream;
+mod video;
 
 use std::{env, error::Error, path::PathBuf, process::ExitCode};
 
-use session::{Input, Session};
+use session::{CaptureSize, Input, Session};
 
 fn main() -> ExitCode {
     match run() {
@@ -51,8 +52,28 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }
                     "--size" => {
                         let size = value()?;
-                        let (width, height) = size.split_once('x').ok_or("Use WIDTHxHEIGHT")?;
-                        session.size = (width.parse()?, height.parse()?);
+                        session.size = parse_size(&size)?;
+                        None
+                    }
+                    "--capture-size" => {
+                        let size = value()?;
+                        session.capture_size = if size == "auto" {
+                            CaptureSize::Auto
+                        } else {
+                            CaptureSize::Fixed(parse_size(&size)?)
+                        };
+                        None
+                    }
+                    "--encoder" => {
+                        session.encoder = value()?.parse()?;
+                        None
+                    }
+                    "--quality" => {
+                        session.quality = value()?.parse()?;
+                        None
+                    }
+                    "--bitrate" => {
+                        session.bitrate = value()?.parse()?;
                         None
                     }
                     "--fps" => {
@@ -100,6 +121,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn parse_size(value: &str) -> Result<(u16, u16), Box<dyn Error>> {
+    let (width, height) = value.split_once('x').ok_or("Use WIDTHxHEIGHT")?;
+    Ok((width.parse()?, height.parse()?))
+}
+
 fn print_help() {
     println!(
         "Stream Smash\n\n\
@@ -109,6 +135,8 @@ fn print_help() {
          record --input FILE            Record a media file at playback speed\n\n\
          Options: --audio-device NAME, --size WIDTHxHEIGHT, --fps N,\n\
                   --seconds N, --output-dir PATH, --stream, --highlights 10|30|60\n\
+         --capture-size WIDTHxHEIGHT|auto (DirectShow only)\n\
+         --encoder auto|cpu|amd|nvidia|intel, --quality fast|balanced|detail, --bitrate KBPS\n\
          --stream also sends RTMP(S) to STREAM_SMASH_RTMP_URL.\n\
          With highlights enabled, press h then Enter to save recent footage.\n\
          --audio-peaks also saves highlights when the audio suddenly gets louder.\n\

@@ -87,10 +87,14 @@ first = receiver("before-drop.flv")
 second = None
 sender = None
 sender_log = (root / "sender.log").open("w+", encoding="utf-8")
+encoder = sys.argv[1] if len(sys.argv) > 1 else "cpu"
+size, fps, bitrate = ("1920x1080", "60", "17000") if "--hd" in sys.argv else ("320x180", "30", "6000")
+expected_frames = int(fps) * 15
 try:
     time.sleep(.4)
     sender = subprocess.Popen([
-        str(exe), "record", "--test-pattern", "--size", "320x180", "--fps", "30",
+        str(exe), "record", "--test-pattern", "--size", size, "--fps", fps,
+        "--encoder", encoder, "--bitrate", bitrate,
         "--seconds", "15", "--stream", "--highlights", "10", "--output-dir", str(root)
     ], env={**os.environ, "STREAM_SMASH_RTMP_URL": url},
        stdout=sender_log, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, text=True)
@@ -124,10 +128,10 @@ try:
     ], text=True)
     info = json.loads(result)
     video, = [s for s in info["streams"] if s["codec_type"] == "video"]
-    assert int(video["nb_read_frames"]) == 450, info
+    assert int(video["nb_read_frames"]) == expected_frames, info
     assert any(s["codec_type"] == "audio" for s in info["streams"]), info
     assert float(info["format"]["duration"]) >= 14.99, info
-    print(f"RTMP reception before and after outage; recording preserved all 450 frames and audio ({info['format']['duration']} s)")
+    print(f"RTMP reception before and after outage; recording preserved all {expected_frames} frames and audio ({info['format']['duration']} s)")
 finally:
     proxy.close()
     stop(first)

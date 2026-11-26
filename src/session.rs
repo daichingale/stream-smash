@@ -14,6 +14,7 @@ use std::{
 use crate::{
     highlight::{AudioPeaks, Highlights, Request},
     stream,
+    video::{Encoder, Quality},
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -22,6 +23,13 @@ pub enum Input {
     TestPattern,
     DirectShow(String, Option<String>),
     File(PathBuf),
+}
+
+#[derive(Clone, Copy)]
+pub enum CaptureSize {
+    MatchOutput,
+    Auto,
+    Fixed((u16, u16)),
 }
 
 pub struct Session {
@@ -33,6 +41,10 @@ pub struct Session {
     pub stream: bool,
     pub highlight_seconds: Option<u16>,
     pub audio_peaks: bool,
+    pub encoder: Encoder,
+    pub quality: Quality,
+    pub bitrate: u32,
+    pub capture_size: CaptureSize,
 }
 
 impl Default for Session {
@@ -46,6 +58,10 @@ impl Default for Session {
             stream: false,
             highlight_seconds: None,
             audio_peaks: false,
+            encoder: Encoder::Cpu,
+            quality: Quality::Balanced,
+            bitrate: 6000,
+            capture_size: CaptureSize::MatchOutput,
         }
     }
 }
@@ -53,12 +69,21 @@ impl Default for Session {
 impl Session {
     pub fn run(self) -> Result<()> {
         let (width, height) = self.size;
-        if !(2..=3840).contains(&width)
-            || !(2..=2160).contains(&height)
-            || width % 2 != 0
-            || height % 2 != 0
-        {
+        if !valid_size(self.size) {
             return Err("Use even dimensions between 2x2 and 3840x2160".into());
+        }
+        if let CaptureSize::Fixed(size) = self.capture_size
+            && !valid_size(size)
+        {
+            return Err("Capture size must use even dimensions up to 3840x2160".into());
+        }
+        if !matches!(self.capture_size, CaptureSize::MatchOutput)
+            && !matches!(self.input, Input::DirectShow(..))
+        {
+            return Err("--capture-size requires --video-device".into());
+        }
+        if !(500..=100_000).contains(&self.bitrate) {
+            return Err("Use --bitrate between 500 and 100000 kbps".into());
         }
         if !(1..=120).contains(&self.fps) || self.seconds == Some(0) {
             return Err("Use 1–120 fps and a positive duration".into());
@@ -91,38 +116,29 @@ impl Session {
         if let Some(seconds) = self.seconds {
             command.args(["-t", &seconds.to_string()]);
         }
-        let filter = format!(
-            "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
-        );
+        if self.needs_scaling() {
+            let method = self.quality.scale_filter();
+            let filter = format!(
+                "scale={width}:{height}:flags={method}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            );
+            command.args(["-vf", &filter]);
+        }
+        let encoder = self
+            .encoder
+            .resolve(self.size, self.fps, self.bitrate, self.quality)
+            .map_err(|error| format!("Could not probe FFmpeg encoders: {error}"))?;
+        encoder.configure(&mut command, self.fps, self.bitrate, self.quality);
         command.args([
-            "-vf",
-            &filter,
             "-r",
             &self.fps.to_string(),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-x264-params",
-            "repeat-headers=1:scenecut=0",
-            "-g",
-            &(self.fps * 2).to_string(),
-            "-b:v",
-            "6000k",
-            "-maxrate",
-            "6000k",
-            "-bufsize",
-            "12000k",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*2)",
             "-c:a",
             "aac",
             "-b:a",
             "160k",
             "-ar",
             "48000",
-            "-flags",
-            "+global_header",
         ]);
         let name = format!(
             "StreamSmash-{}-{}.mkv",
@@ -165,6 +181,12 @@ impl Session {
             .spawn()
             .map_err(|error| format!("Could not start FFmpeg: {error}"))?;
         println!("Recording: {}", path.display());
+        println!(
+            "Encoder: {} | {width}x{height} {} fps | {} kbps target",
+            encoder.name(),
+            self.fps,
+            self.bitrate
+        );
         if self.stream {
             println!("RTMP output enabled. Check the receiving service for live status.");
         }
@@ -221,7 +243,7 @@ impl Session {
             });
             scope.spawn(|| read_progress(stdout, &retries));
             if let Some((address, url)) = relay.as_ref() {
-                scope.spawn(|| stream::relay(*address, url, &done, &retries));
+                scope.spawn(|| stream::relay(*address, url, self.bitrate, &done, &retries));
             }
             if let Some(ref highlights) = highlights {
                 let done = &done;
@@ -249,6 +271,22 @@ impl Session {
         }
         println!("Saved: {}", path.display());
         Ok(())
+    }
+
+    fn directshow_size(&self) -> Option<(u16, u16)> {
+        match self.capture_size {
+            CaptureSize::MatchOutput => Some(self.size),
+            CaptureSize::Auto => None,
+            CaptureSize::Fixed(size) => Some(size),
+        }
+    }
+
+    fn needs_scaling(&self) -> bool {
+        match self.input {
+            Input::TestPattern => false,
+            Input::DirectShow(..) => self.directshow_size() != Some(self.size),
+            Input::File(_) => true,
+        }
     }
 
     fn add_input(&self, command: &mut Command) -> Result<()> {
@@ -291,23 +329,16 @@ impl Session {
                 if let Some(audio) = audio {
                     devices.push_str(&format!(":audio={audio}"));
                 }
-                let (width, height) = self.size;
-                command.args([
-                    "-f",
-                    "dshow",
-                    "-rtbufsize",
-                    "256M",
-                    "-video_size",
-                    &format!("{width}x{height}"),
-                    "-framerate",
-                    &self.fps.to_string(),
-                    "-i",
-                    &devices,
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "0:a:0?",
-                ]);
+                command.args(["-f", "dshow", "-rtbufsize", "256M"]);
+                if let Some((width, height)) = self.directshow_size() {
+                    command.args([
+                        "-video_size",
+                        &format!("{width}x{height}"),
+                        "-framerate",
+                        &self.fps.to_string(),
+                    ]);
+                }
+                command.args(["-i", &devices, "-map", "0:v:0", "-map", "0:a:0?"]);
             }
             Input::File(path) => {
                 command.args(["-re", "-i"]).arg(path.canonicalize()?);
@@ -316,6 +347,10 @@ impl Session {
         }
         Ok(())
     }
+}
+
+fn valid_size((width, height): (u16, u16)) -> bool {
+    (2..=3840).contains(&width) && (2..=2160).contains(&height) && width % 2 == 0 && height % 2 == 0
 }
 
 pub fn list_devices(names_only: bool) -> Result<()> {
@@ -385,19 +420,23 @@ pub fn ffmpeg() -> Command {
 fn read_progress(stdout: impl io::Read, retries: &AtomicU64) {
     let (mut frame, mut dropped, mut duplicated, mut elapsed) =
         ("0".into(), "0".into(), "0".into(), "00:00:00".into());
+    let (mut fps, mut speed) = ("0.0".into(), "N/A".into());
     for line in BufReader::new(stdout)
         .lines()
         .map_while(std::result::Result::ok)
     {
         if let Some((key, value)) = line.split_once('=') {
+            let value = value.trim();
             match key {
                 "frame" => frame = value.to_owned(),
                 "drop_frames" => dropped = value.to_owned(),
                 "dup_frames" => duplicated = value.to_owned(),
                 "out_time" => elapsed = value.to_owned(),
+                "fps" => fps = value.to_owned(),
+                "speed" => speed = value.to_owned(),
                 "progress" => {
                     println!(
-                        "{elapsed} | frames {frame} | encoder dropped {dropped} | duplicated {duplicated} | RTMP retries {}",
+                        "{elapsed} | frames {frame} | encoder dropped {dropped} | duplicated {duplicated} | RTMP retries {} | fps {fps} | speed {speed}",
                         retries.load(Ordering::Relaxed)
                     );
                 }

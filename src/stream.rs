@@ -21,8 +21,18 @@ pub fn validate_url(url: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn relay(address: SocketAddr, destination: &str, done: &AtomicBool, retries: &AtomicU64) {
-    let source = format!("udp://{address}?fifo_size=4096&overrun_nonfatal=1&timeout=2500000");
+pub fn relay(
+    address: SocketAddr,
+    destination: &str,
+    kbps: u32,
+    done: &AtomicBool,
+    retries: &AtomicU64,
+) {
+    let fifo_packets = (kbps * 1000 / (8 * 188 * 2)).max(4096);
+    let source =
+        format!("udp://{address}?fifo_size={fifo_packets}&overrun_nonfatal=1&timeout=2500000");
+    // A restarted relay can join just after an IDR. Read far enough to reach the next one at higher bitrates.
+    let probe_bytes = (kbps * 400).max(4_194_304).to_string();
     while !done.load(Ordering::Relaxed) {
         let mut command = ffmpeg();
         command.args([
@@ -31,7 +41,7 @@ pub fn relay(address: SocketAddr, destination: &str, done: &AtomicBool, retries:
             "-loglevel",
             "error",
             "-probesize",
-            "4194304",
+            &probe_bytes,
             "-analyzeduration",
             "2500000",
             "-fflags",
@@ -51,7 +61,15 @@ pub fn relay(address: SocketAddr, destination: &str, done: &AtomicBool, retries:
             command.args(["-tls_verify", "1"]);
         }
         let sender = command
-            .args(["-f", "flv", destination])
+            .args([
+                "-flush_packets",
+                "1",
+                "-flvflags",
+                "no_duration_filesize",
+                "-f",
+                "flv",
+                destination,
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             // FFmpeg includes the destination URL and stream key in diagnostics.

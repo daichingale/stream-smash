@@ -18,6 +18,10 @@ sealed class StreamSmashWindow : Form
     readonly ComboBox audio = new ComboBox();
     readonly TextBox mediaFile = new TextBox();
     readonly ComboBox resolution = new ComboBox();
+    readonly ComboBox captureResolution = new ComboBox();
+    readonly ComboBox videoPreset = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+    readonly ComboBox encoderChoice = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
+    readonly NumericUpDown bitrate = new NumericUpDown { Minimum = 500, Maximum = 100000, Increment = 500, Value = 12000, ThousandsSeparator = true };
     readonly ComboBox buffer = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList };
     readonly NumericUpDown fps = new NumericUpDown { Minimum = 1, Maximum = 120, Value = 60 };
     readonly TextBox folder = new TextBox { Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "Stream Smash") };
@@ -32,10 +36,11 @@ sealed class StreamSmashWindow : Form
     readonly Button openClip = new Button { Text = "最新クリップを開く", AutoSize = true, Enabled = false };
     readonly Label status = new Label { Text = "準備完了", AutoSize = true, Margin = new Padding(3, 5, 3, 5) };
     readonly Label clipStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
+    readonly Label encoderStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
     readonly TextBox activity = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill };
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 100 };
     readonly ConcurrentQueue<string> messages = new ConcurrentQueue<string>();
-    static readonly Regex Progress = new Regex(@"^(\S+) \| frames (\d+) \| encoder dropped (\d+) \| duplicated (\d+) \| RTMP retries (\d+)$");
+    static readonly Regex Progress = new Regex(@"^(\S+) \| frames (\d+) \| encoder dropped (\d+) \| duplicated (\d+) \| RTMP retries (\d+)(?: \| fps (\S+) \| speed (\S+))?$");
     Process engine;
     int closedPipes;
     bool recording, stopping, closing, highlightPending, hasScanned;
@@ -53,14 +58,14 @@ sealed class StreamSmashWindow : Form
     {
         Text = "Stream Smash";
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(828, 585);
-        MinimumSize = new Size(700, 515);
+        ClientSize = new Size(880, 700);
+        MinimumSize = new Size(730, 570);
         Font = new Font("Segoe UI", 10);
         KeyPreview = true;
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 13 };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 161));
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 18 };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 195));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int row = 0; row < 12; row++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int row = 0; row < 17; row++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         Controls.Add(layout);
         mode.Items.AddRange(new object[] { "テスト映像・音声", "キャプチャー機器", "動画ファイル" });
@@ -68,6 +73,12 @@ sealed class StreamSmashWindow : Form
         source.MaxDropDownItems = audio.MaxDropDownItems = 14;
         resolution.Items.AddRange(new object[] { "1280x720", "1920x1080", "2560x1440", "3840x2160" });
         resolution.Text = "1920x1080";
+        captureResolution.Items.AddRange(new object[] { "出力と同じ", "機器の既定", "1280x720", "1920x1080", "2560x1440", "3840x2160" });
+        captureResolution.SelectedIndex = 0;
+        videoPreset.Items.AddRange(new object[] { "軽量 720p60", "標準 1080p60", "高画質 1080p60", "高解像度 1440p60" });
+        videoPreset.SelectedIndex = 1;
+        encoderChoice.Items.AddRange(new object[] { "自動（GPU 優先）", "CPU（x264）", "AMD（AMF）", "NVIDIA（NVENC）", "Intel（Quick Sync）" });
+        encoderChoice.SelectedIndex = 0;
         buffer.Items.AddRange(new object[] { "オフ", "10 秒", "30 秒", "60 秒" });
         buffer.SelectedIndex = 2;
         var inputs = new Panel { Height = source.PreferredHeight };
@@ -77,21 +88,33 @@ sealed class StreamSmashWindow : Form
         AddField(layout, 0, "入力", mode);
         AddField(layout, 1, "映像機器／動画", inputs);
         AddField(layout, 2, "音声機器", audio);
-        AddField(layout, 3, "解像度", resolution);
-        AddField(layout, 4, "フレームレート", fps);
-        AddField(layout, 5, "録画先", folder);
-        AddField(layout, 6, "配信 URL（任意）", rtmp);
-        AddField(layout, 7, "見せ場の長さ", buffer);
-        AddWide(layout, 8, Actions(devices, browse, chooseFolder, audioPeaks));
-        AddWide(layout, 9, Actions(start, stop, save, openClip));
-        AddWide(layout, 10, status);
-        AddWide(layout, 11, clipStatus);
-        AddWide(layout, 12, activity);
+        AddField(layout, 3, "キャプチャー解像度", captureResolution);
+        AddField(layout, 4, "画質プリセット", videoPreset);
+        AddField(layout, 5, "出力解像度", resolution);
+        AddField(layout, 6, "フレームレート", fps);
+        AddField(layout, 7, "映像ビットレート（kbps）", bitrate);
+        AddField(layout, 8, "エンコーダー", encoderChoice);
+        AddField(layout, 9, "録画先", folder);
+        AddField(layout, 10, "配信 URL（任意）", rtmp);
+        AddField(layout, 11, "見せ場の長さ", buffer);
+        AddWide(layout, 12, Actions(devices, browse, chooseFolder, audioPeaks));
+        AddWide(layout, 13, Actions(start, stop, save, openClip));
+        AddWide(layout, 14, status);
+        AddWide(layout, 15, encoderStatus);
+        AddWide(layout, 16, clipStatus);
+        AddWide(layout, 17, activity);
         mode.SelectedIndexChanged += (sender, args) => {
             UpdateControls();
             if (mode.SelectedIndex == 1 && !hasScanned && engine == null) ScanDevices();
         };
         rtmp.TextChanged += (sender, args) => start.Text = string.IsNullOrWhiteSpace(rtmp.Text) ? "録画開始" : "録画と配信を開始";
+        videoPreset.SelectedIndexChanged += (sender, args) => {
+            string[] sizes = { "1280x720", "1920x1080", "1920x1080", "2560x1440" };
+            int[] rates = { 6000, 12000, 17000, 34000 };
+            resolution.Text = sizes[videoPreset.SelectedIndex];
+            fps.Value = 60;
+            bitrate.Value = rates[videoPreset.SelectedIndex];
+        };
         buffer.SelectedIndexChanged += (sender, args) => UpdateControls();
         devices.Click += (sender, args) => ScanDevices();
         browse.Click += (sender, args) => {
@@ -158,12 +181,13 @@ sealed class StreamSmashWindow : Form
     void UpdateControls()
     {
         bool idle = engine == null;
-        foreach (var control in new Control[] { mode, resolution, fps, folder, rtmp, buffer, chooseFolder, start }) control.Enabled = idle;
+        foreach (var control in new Control[] { mode, videoPreset, resolution, fps, bitrate, encoderChoice, folder, rtmp, buffer, chooseFolder, start }) control.Enabled = idle;
         source.Visible = mode.SelectedIndex != 2;
         mediaFile.Visible = mode.SelectedIndex == 2;
         source.Enabled = idle && mode.SelectedIndex == 1;
         mediaFile.Enabled = idle && mode.SelectedIndex == 2;
         audio.Enabled = idle && mode.SelectedIndex == 1;
+        captureResolution.Enabled = idle && mode.SelectedIndex == 1;
         devices.Enabled = idle && mode.SelectedIndex == 1;
         browse.Enabled = idle && mode.SelectedIndex == 2;
         stop.Enabled = !idle && recording && !stopping;
@@ -179,12 +203,21 @@ sealed class StreamSmashWindow : Form
             status.Text = "入力、解像度、録画先を指定してください。";
             return;
         }
-        var args = new List<string> { "record", "--size", resolution.Text.Trim(), "--fps", fps.Value.ToString(), "--output-dir", folder.Text.Trim() };
+        string[] encoders = { "auto", "cpu", "amd", "nvidia", "intel" };
+        string[] qualities = { "fast", "balanced", "detail", "detail" };
+        var args = new List<string> {
+            "record", "--size", resolution.Text.Trim(), "--fps", fps.Value.ToString(),
+            "--output-dir", folder.Text.Trim(), "--bitrate", bitrate.Value.ToString(),
+            "--encoder", encoders[encoderChoice.SelectedIndex], "--quality", qualities[videoPreset.SelectedIndex]
+        };
         switch (mode.SelectedIndex) {
             case 0: args.Add("--test-pattern"); break;
             case 1:
                 args.AddRange(new[] { "--video-device", video });
                 if (!string.IsNullOrWhiteSpace(audio.Text)) args.AddRange(new[] { "--audio-device", audio.Text.Trim() });
+                string capture = captureResolution.Text.Trim();
+                if (capture == "機器の既定") args.AddRange(new[] { "--capture-size", "auto" });
+                else if (capture.Length > 0 && capture != "出力と同じ") args.AddRange(new[] { "--capture-size", capture });
                 break;
             case 2: args.AddRange(new[] { "--input", video }); break;
         }
@@ -223,6 +256,7 @@ sealed class StreamSmashWindow : Form
             return;
         }
         activity.Clear();
+        if (record) encoderStatus.Text = "";
         closedPipes = 0;
         engine = child;
         recording = record;
@@ -286,12 +320,15 @@ sealed class StreamSmashWindow : Form
                 highlightPending = false;
                 UpdateControls();
             }
+            if (line.StartsWith("Encoder: ", StringComparison.Ordinal))
+                encoderStatus.Text = "使用中のエンコーダー　" + line.Substring("Encoder: ".Length);
             var progress = Progress.Match(line);
             if (progress.Success) {
                 if (!stopping) {
                     var fields = progress.Groups;
                     status.Text = string.Format("{0}  ｜  {1} フレーム  ｜  間引き {2}・重複 {3}  ｜  配信再試行 {4}",
                         fields[1].Value.Split('.')[0], fields[2], fields[3], fields[4], fields[5]);
+                    if (fields[6].Success) status.Text += string.Format("  ｜  処理 {0} fps", fields[6]);
                 }
             } else {
                 if (activity.TextLength > 20000) activity.Text = activity.Text.Substring(10000);
