@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Write},
     net::UdpSocket,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{self, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     thread,
@@ -47,6 +47,11 @@ pub struct Session {
     pub capture_size: CaptureSize,
     pub preview_image: Option<PathBuf>,
     pub preview_only: bool,
+    pub preview_size: (u16, u16),
+    pub preview_fps: u16,
+    pub preview_quality: u8,
+    pub overlay: Option<PathBuf>,
+    pub overlay_opacity: u8,
 }
 
 impl Default for Session {
@@ -66,6 +71,11 @@ impl Default for Session {
             capture_size: CaptureSize::MatchOutput,
             preview_image: None,
             preview_only: false,
+            preview_size: (640, 360),
+            preview_fps: 12,
+            preview_quality: 84,
+            overlay: None,
+            overlay_opacity: 100,
         }
     }
 }
@@ -95,6 +105,21 @@ impl Session {
         if self.audio_peaks && self.highlight_seconds.is_none() {
             return Err("--audio-peaks requires --highlights".into());
         }
+        if !valid_size(self.preview_size)
+            || self.preview_size.0 > 1920
+            || self.preview_size.1 > 1080
+            || !(1..=60).contains(&self.preview_fps)
+            || !(1..=100).contains(&self.preview_quality)
+        {
+            return Err(
+                "Preview requires even dimensions up to 1920x1080, 1-60 fps, and quality 1-100"
+                    .into(),
+            );
+        }
+        if self.overlay_opacity > 100 {
+            return Err("Use --overlay-opacity between 0 and 100".into());
+        }
+        let overlay = self.overlay.as_deref().map(validate_overlay).transpose()?;
         let preview = self
             .preview_image
             .as_ref()
@@ -113,7 +138,10 @@ impl Session {
             let mut command = ffmpeg();
             command.args(["-hide_banner", "-loglevel", "warning", "-nostats", "-n"]);
             self.add_input(&mut command, false)?;
-            self.add_preview(&mut command, preview);
+            if let Some(overlay) = overlay.as_ref() {
+                self.add_overlay(&mut command, overlay, false, true);
+            }
+            self.add_preview(&mut command, preview, overlay.is_some());
             if !command.status()?.success() {
                 return Err("FFmpeg could not start the preview".into());
             }
@@ -138,19 +166,27 @@ impl Session {
             "pipe:1",
         ]);
         let audio_map = self.add_input(&mut command, true)?;
-        command.args(["-map", "0:v:0", "-map", audio_map]);
+        if let Some(overlay) = overlay.as_ref() {
+            self.add_overlay(&mut command, overlay, true, preview.is_some());
+        }
+        command.args([
+            "-map",
+            if overlay.is_some() {
+                "[program]"
+            } else {
+                "0:v:0"
+            },
+            "-map",
+            audio_map,
+        ]);
         if self.audio_peaks {
             command.args(["-af", AudioPeaks::FILTER]);
         }
         if let Some(seconds) = self.seconds {
             command.args(["-t", &seconds.to_string()]);
         }
-        if self.needs_scaling() {
-            let method = self.quality.scale_filter();
-            let filter = format!(
-                "scale={width}:{height}:flags={method}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
-            );
-            command.args(["-vf", &filter]);
+        if overlay.is_none() && self.needs_scaling() {
+            command.args(["-vf", &self.program_filter()]);
         }
         let encoder = self
             .encoder
@@ -202,7 +238,7 @@ impl Session {
             command.arg(&name);
         }
         if let Some(preview) = preview.as_ref() {
-            self.add_preview(&mut command, preview);
+            self.add_preview(&mut command, preview, overlay.is_some());
         }
         command
             .current_dir(&output_dir)
@@ -321,33 +357,80 @@ impl Session {
         }
     }
 
-    fn add_preview(&self, command: &mut Command, path: &std::path::Path) {
+    fn program_filter(&self) -> String {
         let (width, height) = self.size;
-        let scale = (640.0 / f64::from(width))
-            .min(360.0 / f64::from(height))
+        let method = self.quality.scale_filter();
+        format!(
+            "scale={width}:{height}:flags={method}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+        )
+    }
+
+    fn add_overlay(&self, command: &mut Command, path: &Path, recording: bool, preview: bool) {
+        let (width, height) = self.size;
+        let index = if recording && matches!(self.input, Input::TestPattern) {
+            2
+        } else {
+            1
+        };
+        let opacity = f64::from(self.overlay_opacity) / 100.0;
+        let input = if self.needs_scaling() {
+            self.program_filter()
+        } else {
+            "null".into()
+        };
+        let outputs = match (recording, preview) {
+            (true, true) => format!(
+                ",split[program][monitor];[monitor]{}[preview]",
+                self.preview_filter()
+            ),
+            (true, false) => "[program]".into(),
+            (false, _) => format!(",{}[preview]", self.preview_filter()),
+        };
+        let graph = format!(
+            "[0:v:0]{input}[base];[{index}:v:0]scale={width}:{height}:flags=bilinear,format=rgba,colorchannelmixer=aa={opacity}[art];[base][art]overlay=alpha=straight:eof_action=repeat{outputs}"
+        );
+        command
+            .args(["-f", "image2", "-pattern_type", "none", "-c:v", "png", "-i"])
+            .arg(path);
+        command.args(["-filter_complex", &graph]);
+    }
+
+    fn preview_filter(&self) -> String {
+        let (width, height) = self.size;
+        let scale = (f64::from(self.preview_size.0) / f64::from(width))
+            .min(f64::from(self.preview_size.1) / f64::from(height))
             .min(1.0);
         let preview_width = ((f64::from(width) * scale) as u16 & !1).max(2);
         let preview_height = ((f64::from(height) * scale) as u16 & !1).max(2);
-        let fps = self.fps.min(12);
-        let filter = format!(
-            "fps={fps},scale={preview_width}:{preview_height}:flags=fast_bilinear:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,pad={preview_width}:{preview_height}:(ow-iw)/2:(oh-ih)/2"
-        );
+        let fps = self.fps.min(self.preview_fps);
+        let scaler = if self.preview_quality >= 90 {
+            "lanczos"
+        } else {
+            "fast_bilinear"
+        };
+        format!(
+            "fps={fps},scale={preview_width}:{preview_height}:flags={scaler}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,pad={preview_width}:{preview_height}:(ow-iw)/2:(oh-ih)/2"
+        )
+    }
+
+    fn add_preview(&self, command: &mut Command, path: &Path, composited: bool) {
         if let Some(seconds) = self.seconds {
             command.args(["-t", &seconds.to_string()]);
         }
+        command.args(["-map", if composited { "[preview]" } else { "0:v:0" }]);
+        if !composited {
+            command.args(["-vf", &self.preview_filter()]);
+        }
+        let quantizer = 2 + (100 - self.preview_quality) / 4;
         command
             .args([
-                "-map",
-                "0:v:0",
                 "-an",
-                "-vf",
-                &filter,
                 "-c:v",
                 "mjpeg",
                 "-threads:v",
                 "1",
                 "-q:v",
-                "6",
+                &quantizer.to_string(),
                 "-f",
                 "image2",
                 "-update",
@@ -410,6 +493,26 @@ impl Session {
         }
         Ok("0:a:0?")
     }
+}
+
+fn validate_overlay(path: &Path) -> Result<PathBuf> {
+    use io::Read;
+    let path = path.canonicalize()?;
+    let mut header = [0u8; 24];
+    let mut file = fs::File::open(&path)?;
+    if file.metadata()?.len() > 32 * 1024 * 1024
+        || file.read_exact(&mut header).is_err()
+        || &header[..8] != b"\x89PNG\r\n\x1a\n"
+        || &header[12..16] != b"IHDR"
+        || header[16..24].chunks_exact(4).any(|bytes| {
+            !(1..=4096).contains(&u32::from_be_bytes(
+                bytes.try_into().expect("4-byte PNG dimension"),
+            ))
+        })
+    {
+        return Err("Overlay must be a PNG up to 4096x4096 and 32 MiB".into());
+    }
+    Ok(path)
 }
 
 fn valid_size((width, height): (u16, u16)) -> bool {

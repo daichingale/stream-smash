@@ -103,6 +103,26 @@ fn run() -> Result<(), Box<dyn Error>> {
                         session.preview_image = Some(value()?.into());
                         None
                     }
+                    "--preview-size" => {
+                        session.preview_size = parse_size(&value()?)?;
+                        None
+                    }
+                    "--preview-fps" => {
+                        session.preview_fps = value()?.parse()?;
+                        None
+                    }
+                    "--preview-quality" => {
+                        session.preview_quality = value()?.parse()?;
+                        None
+                    }
+                    "--overlay" => {
+                        session.overlay = Some(value()?.into());
+                        None
+                    }
+                    "--overlay-opacity" => {
+                        session.overlay_opacity = value()?.parse()?;
+                        None
+                    }
                     _ => {
                         return Err(
                             format!("Unknown option {flag}. See stream-smash --help.").into()
@@ -142,6 +162,8 @@ fn print_help() {
          record --input FILE            Record a media file at playback speed\n\n\
          preview --test-pattern --preview-image PATH   Preview without recording\n\
          Add --preview-image PATH to record for a live JPEG preview.\n\n\
+         --preview-size WIDTHxHEIGHT, --preview-fps 1-60, --preview-quality 1-100\n\
+         --overlay PNG overlays a full-canvas image; --overlay-opacity 0-100\n\n\
          Options: --audio-device NAME, --size WIDTHxHEIGHT, --fps N,\n\
                   --seconds N, --output-dir PATH, --stream, --highlights 10|30|60\n\
          --capture-size WIDTHxHEIGHT|auto (DirectShow only)\n\

@@ -90,6 +90,14 @@ sender_log = (root / "sender.log").open("w+", encoding="utf-8")
 encoder = sys.argv[1] if len(sys.argv) > 1 else "cpu"
 size, fps, bitrate = ("1920x1080", "60", "17000") if "--hd" in sys.argv else ("320x180", "30", "6000")
 expected_frames = int(fps) * 15
+overlay_args = []
+if "--overlay" in sys.argv:
+    overlay = root / "red.png"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=red:s=32x18",
+        "-frames:v", "1", "-threads", "1", str(overlay),
+    ], check=True)
+    overlay_args = ["--overlay", str(overlay)]
 try:
     time.sleep(.4)
     sender = subprocess.Popen([
@@ -97,10 +105,12 @@ try:
         "--encoder", encoder, "--bitrate", bitrate,
         "--seconds", "15", "--stream", "--highlights", "10", "--output-dir", str(root),
         "--preview-image", str(root / "preview.jpg"),
+        *overlay_args,
     ], env={**os.environ, "STREAM_SMASH_RTMP_URL": url},
        stdout=sender_log, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, text=True)
     wait_received(first, "before-drop.flv")
-    preview_before = (root / "preview.jpg").read_bytes()
+    preview_path = root / "preview.jpg"
+    preview_before = preview_path.stat().st_mtime_ns
     with proxy_lock:
         upstream = None
         for conn in active:
@@ -115,8 +125,14 @@ try:
     time.sleep(1.5)
     second = receiver("after-drop.flv")
     wait_received(second, "after-drop.flv")
-    assert (root / "preview.jpg").read_bytes() != preview_before, "Preview stopped refreshing"
+    assert preview_path.stat().st_mtime_ns > preview_before, "Preview stopped refreshing"
     sender.wait(timeout=25)
+    if overlay_args:
+        rgb = subprocess.check_output([
+            "ffmpeg", "-v", "error", "-i", str(root / "after-drop.flv"),
+            "-vf", "scale=1:1,format=rgb24", "-frames:v", "1", "-f", "rawvideo", "-",
+        ])
+        assert len(rgb) == 3 and rgb[0] > 220 and max(rgb[1:]) < 35, rgb
     sender_log.seek(0)
     log = sender_log.read()
     assert sender.returncode == 0 and url not in log, log

@@ -36,12 +36,16 @@ sealed class StreamSmashWindow : Form
     readonly Button openClip = new Button { Text = "最新クリップを開く", AutoSize = true, Enabled = false };
     readonly Button previewButton = new Button { Text = "プレビュー開始", AutoSize = true };
     readonly CheckBox livePreview = new CheckBox { Text = "録画・配信中も表示", Checked = true, AutoSize = true };
+    readonly TextBox overlay = new TextBox { ReadOnly = true };
+    readonly Button chooseOverlay = new Button { Text = "PNGを選ぶ", AutoSize = true };
+    readonly Button clearOverlay = new Button { Text = "解除", AutoSize = true };
+    readonly NumericUpDown opacity = new NumericUpDown { Minimum = 0, Maximum = 100, Value = 100 };
     readonly PreviewPane preview = new PreviewPane();
     readonly Label status = new Label { Text = "準備完了", AutoSize = true, Margin = new Padding(3, 5, 3, 5) };
     readonly Label clipStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
     readonly Label encoderStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
     readonly TextBox activity = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill };
-    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 100 };
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 50 };
     readonly ConcurrentQueue<string> messages = new ConcurrentQueue<string>();
     static readonly Regex Progress = new Regex(@"^(\S+) \| frames (\d+) \| encoder dropped (\d+) \| duplicated (\d+) \| RTMP retries (\d+)(?: \| fps (\S+) \| speed (\S+))?$");
     Process engine;
@@ -61,21 +65,44 @@ sealed class StreamSmashWindow : Form
     {
         Text = "Stream Smash";
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(1160, 700);
+        ClientSize = new Size(1260, 740);
         MinimumSize = new Size(870, 570);
         Font = new Font("Segoe UI", 10);
+        BackColor = StudioColors.Background;
         KeyPreview = true;
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 18 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 195));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int row = 0; row < 17; row++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var columns = new SplitContainer { Dock = DockStyle.Fill, Size = ClientSize, SplitterDistance = 540 };
+        var columns = new SplitContainer { Dock = DockStyle.Fill, Size = ClientSize, SplitterDistance = 510, SplitterWidth = 8 };
         columns.Panel1MinSize = 460;
         columns.Panel2MinSize = 280;
         columns.Panel1.Controls.Add(layout);
-        columns.Panel2.Controls.Add(preview);
-        Controls.Add(columns);
+        var right = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), ColumnCount = 1, RowCount = 3 };
+        right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        right.Controls.Add(preview, 0, 0);
+        var overlayControls = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, Padding = new Padding(10), BackColor = StudioColors.Panel };
+        overlayControls.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 154));
+        overlayControls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        AddField(overlayControls, 0, "オーバーレイ PNG", overlay);
+        AddField(overlayControls, 1, "不透明度 (%)", opacity);
+        AddWide(overlayControls, 2, Actions(chooseOverlay, clearOverlay));
+        right.Controls.Add(overlayControls, 0, 1);
+        columns.Panel2.Controls.Add(right);
+        var shell = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var title = new Label {
+            Text = "Stream Smash", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(20, 0, 0, 0), Font = new Font("Segoe UI Semibold", 18),
+            ForeColor = StudioColors.Accent
+        };
+        shell.Controls.Add(title, 0, 0);
+        shell.Controls.Add(columns, 0, 1);
+        Controls.Add(shell);
         mode.Items.AddRange(new object[] { "テスト映像・音声", "キャプチャー機器", "動画ファイル" });
         mode.SelectedIndex = 0;
         source.MaxDropDownItems = audio.MaxDropDownItems = 14;
@@ -133,6 +160,11 @@ sealed class StreamSmashWindow : Form
             using (var dialog = new FolderBrowserDialog { SelectedPath = folder.Text })
                 if (dialog.ShowDialog(this) == DialogResult.OK) folder.Text = dialog.SelectedPath;
         };
+        chooseOverlay.Click += (sender, args) => {
+            using (var dialog = new OpenFileDialog { Filter = "PNG 画像 (*.png)|*.png" })
+                if (dialog.ShowDialog(this) == DialogResult.OK) { overlay.Text = dialog.FileName; UpdateControls(); }
+        };
+        clearOverlay.Click += (sender, args) => { overlay.Clear(); UpdateControls(); };
         start.Click += (sender, args) => {
             if (previewing) {
                 recordAfterPreview = true;
@@ -164,6 +196,8 @@ sealed class StreamSmashWindow : Form
             preview.ReadFrame();
             ReadActivity();
         };
+        StudioColors.Apply(this);
+        StudioColors.Primary(start);
         UpdateControls();
         timer.Start();
     }
@@ -212,6 +246,9 @@ sealed class StreamSmashWindow : Form
         stop.Enabled = !idle && (recording || previewing) && !stopping;
         save.Enabled = stop.Enabled && recording && buffer.SelectedIndex > 0 && !highlightPending;
         audioPeaks.Enabled = idle && buffer.SelectedIndex > 0;
+        chooseOverlay.Enabled = idle;
+        clearOverlay.Enabled = opacity.Enabled = idle && overlay.Text.Length > 0;
+        preview.SettingsEnabled = idle;
     }
 
     void StartCapture(bool onlyPreview)
@@ -247,9 +284,12 @@ sealed class StreamSmashWindow : Form
         }
         string destination = onlyPreview ? "" : rtmp.Text.Trim();
         if (destination.Length > 0) args.Add("--stream");
+        if (overlay.Text.Length > 0)
+            args.AddRange(new[] { "--overlay", overlay.Text, "--overlay-opacity", opacity.Value.ToString() });
         if (onlyPreview || livePreview.Checked) {
             preview.Begin();
-            args.AddRange(new[] { "--preview-image", preview.ImagePath });
+            args.AddRange(preview.Arguments());
+            timer.Interval = preview.RefreshInterval;
         }
         Launch(args, !onlyPreview, destination, onlyPreview);
         if (engine == null) preview.End();
@@ -371,6 +411,7 @@ sealed class StreamSmashWindow : Form
         previewing = false;
         recordAfterPreview = false;
         if (wasCapture) preview.End();
+        timer.Interval = 50;
         UpdateControls();
         if (closing) Close();
         else if (beginRecording) StartCapture(false);
