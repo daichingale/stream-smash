@@ -1,4 +1,4 @@
-# Stream Smash 0.3.0
+# Stream Smash 0.4.0
 
 OBSを経由せず、ゲーム映像の録画と配信を行うオープンソースのWindowsアプリです。再構築版のエンジンはRust、Windowsの操作画面はWinForms、映像・音声の処理はFFmpegを使用します。
 
@@ -13,6 +13,12 @@ DirectShow・libx264対応の [FFmpeg](https://ffmpeg.org/download.html#build-wi
 - **テスト映像・音声** で録画を試せます。**キャプチャー機器** を選ぶと接続機器を検索し、映像機器・音声機器の候補を表示します。必要に応じて機器名を直接入力し、機器が対応する解像度とfpsを選んでください。
 - **配信 URL** を入力すると、MKV録画と配信が同時に始まります。空欄の場合は録画だけを行います。
 - 録画中は経過時間、エンコード済みフレームと処理fps、間引き・重複、配信リトライ回数を表示します。受信状況は配信先の画面で確認してください。
+
+## 映像をプレビューする
+
+**プレビュー開始** で、録画や配信を始める前に映像を確認できます。**別ウィンドウ** を押すと映像だけを切り離せます。別モニターへの移動、サイズ変更、**最前面** 固定に対応し、ウィンドウを閉じるとメイン画面に戻ります。
+
+録画・配信中は同じ入力を使って出力の画角を表示します。プレビューは最大640×360・12fpsで、音声は再生しません。表示が不要な場合は **録画・配信中も表示** をオフにしてから開始すると、プレビュー画像の生成を省けます。
 
 ## 配信画質と負荷を調整する
 
@@ -51,4 +57,4 @@ AMD AMFの1080p60・17 Mbps設定でも同じ切断テストを行い、15秒の
 
 Python 3、FFmpeg、FFprobeを用意し、`cargo build --locked` の後に `python tests/highlights.py`、`python tests/audio_highlights.py`、`python tests/rtmp_reconnect.py` を実行すると、クリップ保存とローカル配信の切断・復旧を検証できます。
 
-WindowsでAMD AMFの動作を検証しています。NVIDIA NVENC、Intel Quick Sync、AVerMedia実機の入力、YouTube本番配信、macOS・Linuxでの動作は未検証です。旧版のライブプレビューと撃墜・試合終了の画像認識は再構築版に未移植です。[旧バージョンから復元できたソース](https://github.com/daichingale/stream-smash/tree/recovery/rust-snapshots/recovered)
+WindowsでAMD AMFの動作を検証しています。NVIDIA NVENC、Intel Quick Sync、AVerMedia実機の入力、YouTube本番配信、macOS・Linuxでの動作は未検証です。撃墜・試合終了の画像認識は未実装です。[旧バージョンから復元できたソース](https://github.com/daichingale/stream-smash/tree/recovery/rust-snapshots/recovered)

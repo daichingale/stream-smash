@@ -95,10 +95,12 @@ try:
     sender = subprocess.Popen([
         str(exe), "record", "--test-pattern", "--size", size, "--fps", fps,
         "--encoder", encoder, "--bitrate", bitrate,
-        "--seconds", "15", "--stream", "--highlights", "10", "--output-dir", str(root)
+        "--seconds", "15", "--stream", "--highlights", "10", "--output-dir", str(root),
+        "--preview-image", str(root / "preview.jpg"),
     ], env={**os.environ, "STREAM_SMASH_RTMP_URL": url},
        stdout=sender_log, stderr=subprocess.STDOUT, stdin=subprocess.PIPE, text=True)
     wait_received(first, "before-drop.flv")
+    preview_before = (root / "preview.jpg").read_bytes()
     with proxy_lock:
         upstream = None
         for conn in active:
@@ -113,6 +115,7 @@ try:
     time.sleep(1.5)
     second = receiver("after-drop.flv")
     wait_received(second, "after-drop.flv")
+    assert (root / "preview.jpg").read_bytes() != preview_before, "Preview stopped refreshing"
     sender.wait(timeout=25)
     sender_log.seek(0)
     log = sender_log.read()

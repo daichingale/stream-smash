@@ -34,6 +34,9 @@ sealed class StreamSmashWindow : Form
     readonly Button stop = new Button { Text = "停止", AutoSize = true };
     readonly Button save = new Button { Text = "見せ場を保存（F8）", AutoSize = true };
     readonly Button openClip = new Button { Text = "最新クリップを開く", AutoSize = true, Enabled = false };
+    readonly Button previewButton = new Button { Text = "プレビュー開始", AutoSize = true };
+    readonly CheckBox livePreview = new CheckBox { Text = "録画・配信中も表示", Checked = true, AutoSize = true };
+    readonly PreviewPane preview = new PreviewPane();
     readonly Label status = new Label { Text = "準備完了", AutoSize = true, Margin = new Padding(3, 5, 3, 5) };
     readonly Label clipStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
     readonly Label encoderStatus = new Label { AutoSize = true, Margin = new Padding(3, 0, 3, 5) };
@@ -43,7 +46,7 @@ sealed class StreamSmashWindow : Form
     static readonly Regex Progress = new Regex(@"^(\S+) \| frames (\d+) \| encoder dropped (\d+) \| duplicated (\d+) \| RTMP retries (\d+)(?: \| fps (\S+) \| speed (\S+))?$");
     Process engine;
     int closedPipes;
-    bool recording, stopping, closing, highlightPending, hasScanned;
+    bool recording, previewing, recordAfterPreview, stopping, closing, highlightPending, hasScanned;
     string latestClip;
 
     [STAThread]
@@ -58,8 +61,8 @@ sealed class StreamSmashWindow : Form
     {
         Text = "Stream Smash";
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(880, 700);
-        MinimumSize = new Size(730, 570);
+        ClientSize = new Size(1160, 700);
+        MinimumSize = new Size(870, 570);
         Font = new Font("Segoe UI", 10);
         KeyPreview = true;
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(16), ColumnCount = 2, RowCount = 18 };
@@ -67,7 +70,12 @@ sealed class StreamSmashWindow : Form
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int row = 0; row < 17; row++) layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        Controls.Add(layout);
+        var columns = new SplitContainer { Dock = DockStyle.Fill, Size = ClientSize, SplitterDistance = 540 };
+        columns.Panel1MinSize = 460;
+        columns.Panel2MinSize = 280;
+        columns.Panel1.Controls.Add(layout);
+        columns.Panel2.Controls.Add(preview);
+        Controls.Add(columns);
         mode.Items.AddRange(new object[] { "テスト映像・音声", "キャプチャー機器", "動画ファイル" });
         mode.SelectedIndex = 0;
         source.MaxDropDownItems = audio.MaxDropDownItems = 14;
@@ -97,8 +105,8 @@ sealed class StreamSmashWindow : Form
         AddField(layout, 9, "録画先", folder);
         AddField(layout, 10, "配信 URL（任意）", rtmp);
         AddField(layout, 11, "見せ場の長さ", buffer);
-        AddWide(layout, 12, Actions(devices, browse, chooseFolder, audioPeaks));
-        AddWide(layout, 13, Actions(start, stop, save, openClip));
+        AddWide(layout, 12, Actions(devices, browse, chooseFolder, audioPeaks, livePreview));
+        AddWide(layout, 13, Actions(previewButton, start, stop, save, openClip));
         AddWide(layout, 14, status);
         AddWide(layout, 15, encoderStatus);
         AddWide(layout, 16, clipStatus);
@@ -125,7 +133,13 @@ sealed class StreamSmashWindow : Form
             using (var dialog = new FolderBrowserDialog { SelectedPath = folder.Text })
                 if (dialog.ShowDialog(this) == DialogResult.OK) folder.Text = dialog.SelectedPath;
         };
-        start.Click += (sender, args) => StartRecording();
+        start.Click += (sender, args) => {
+            if (previewing) {
+                recordAfterPreview = true;
+                StopRecording();
+            } else StartCapture(false);
+        };
+        previewButton.Click += (sender, args) => StartCapture(true);
         stop.Click += (sender, args) => StopRecording();
         save.Click += (sender, args) => SaveHighlight();
         openClip.Click += (sender, args) => {
@@ -139,13 +153,17 @@ sealed class StreamSmashWindow : Form
             SaveHighlight();
         };
         FormClosing += (sender, args) => {
-            if (engine == null || !recording || engine.HasExited) return;
+            if (engine == null || !(recording || previewing) || engine.HasExited) return;
             args.Cancel = true;
             closing = true;
+            recordAfterPreview = false;
             StopRecording();
         };
         FormClosed += (sender, args) => timer.Dispose();
-        timer.Tick += (sender, args) => ReadActivity();
+        timer.Tick += (sender, args) => {
+            preview.ReadFrame();
+            ReadActivity();
+        };
         UpdateControls();
         timer.Start();
     }
@@ -181,7 +199,8 @@ sealed class StreamSmashWindow : Form
     void UpdateControls()
     {
         bool idle = engine == null;
-        foreach (var control in new Control[] { mode, videoPreset, resolution, fps, bitrate, encoderChoice, folder, rtmp, buffer, chooseFolder, start }) control.Enabled = idle;
+        foreach (var control in new Control[] { mode, videoPreset, resolution, fps, bitrate, encoderChoice, folder, rtmp, buffer, chooseFolder, previewButton, livePreview }) control.Enabled = idle;
+        start.Enabled = idle || (previewing && !stopping);
         source.Visible = mode.SelectedIndex != 2;
         mediaFile.Visible = mode.SelectedIndex == 2;
         source.Enabled = idle && mode.SelectedIndex == 1;
@@ -190,23 +209,23 @@ sealed class StreamSmashWindow : Form
         captureResolution.Enabled = idle && mode.SelectedIndex == 1;
         devices.Enabled = idle && mode.SelectedIndex == 1;
         browse.Enabled = idle && mode.SelectedIndex == 2;
-        stop.Enabled = !idle && recording && !stopping;
-        save.Enabled = stop.Enabled && buffer.SelectedIndex > 0 && !highlightPending;
+        stop.Enabled = !idle && (recording || previewing) && !stopping;
+        save.Enabled = stop.Enabled && recording && buffer.SelectedIndex > 0 && !highlightPending;
         audioPeaks.Enabled = idle && buffer.SelectedIndex > 0;
     }
 
-    void StartRecording()
+    void StartCapture(bool onlyPreview)
     {
         string video = mode.SelectedIndex == 2 ? mediaFile.Text.Trim() : source.Text.Trim();
         if ((mode.SelectedIndex != 0 && video.Length == 0)
-            || string.IsNullOrWhiteSpace(folder.Text) || string.IsNullOrWhiteSpace(resolution.Text)) {
+            || (!onlyPreview && string.IsNullOrWhiteSpace(folder.Text)) || string.IsNullOrWhiteSpace(resolution.Text)) {
             status.Text = "入力、解像度、録画先を指定してください。";
             return;
         }
         string[] encoders = { "auto", "cpu", "amd", "nvidia", "intel" };
         string[] qualities = { "fast", "balanced", "detail", "detail" };
         var args = new List<string> {
-            "record", "--size", resolution.Text.Trim(), "--fps", fps.Value.ToString(),
+            onlyPreview ? "preview" : "record", "--size", resolution.Text.Trim(), "--fps", fps.Value.ToString(),
             "--output-dir", folder.Text.Trim(), "--bitrate", bitrate.Value.ToString(),
             "--encoder", encoders[encoderChoice.SelectedIndex], "--quality", qualities[videoPreset.SelectedIndex]
         };
@@ -221,14 +240,19 @@ sealed class StreamSmashWindow : Form
                 break;
             case 2: args.AddRange(new[] { "--input", video }); break;
         }
-        if (buffer.SelectedIndex > 0) {
+        if (!onlyPreview && buffer.SelectedIndex > 0) {
             string[] lengths = { "", "10", "30", "60" };
             args.AddRange(new[] { "--highlights", lengths[buffer.SelectedIndex] });
             if (audioPeaks.Checked) args.Add("--audio-peaks");
         }
-        string destination = rtmp.Text.Trim();
+        string destination = onlyPreview ? "" : rtmp.Text.Trim();
         if (destination.Length > 0) args.Add("--stream");
-        Launch(args, true, destination);
+        if (onlyPreview || livePreview.Checked) {
+            preview.Begin();
+            args.AddRange(new[] { "--preview-image", preview.ImagePath });
+        }
+        Launch(args, !onlyPreview, destination, onlyPreview);
+        if (engine == null) preview.End();
     }
 
     static string Quote(string argument)
@@ -237,7 +261,7 @@ sealed class StreamSmashWindow : Form
         return "\"" + Regex.Replace(escaped, @"(\\+)$", "$1$1") + "\"";
     }
 
-    void Launch(IEnumerable<string> args, bool record, string destination)
+    void Launch(IEnumerable<string> args, bool record, string destination, bool onlyPreview = false)
     {
         var info = new ProcessStartInfo {
             FileName = Engine, Arguments = string.Join(" ", args.Select(Quote)), UseShellExecute = false,
@@ -260,9 +284,10 @@ sealed class StreamSmashWindow : Form
         closedPipes = 0;
         engine = child;
         recording = record;
+        previewing = onlyPreview;
         stopping = false;
         highlightPending = false;
-        status.Text = record ? "録画を開始しています…" : "接続機器を検索しています…";
+        status.Text = record ? "録画を開始しています…" : onlyPreview ? "プレビュー中" : "接続機器を検索しています…";
         UpdateControls();
         child.BeginOutputReadLine();
         child.BeginErrorReadLine();
@@ -281,7 +306,7 @@ sealed class StreamSmashWindow : Form
             engine.StandardInput.WriteLine("q");
             engine.StandardInput.Flush();
             stopping = true;
-            status.Text = "録画を保存しています…";
+            status.Text = previewing ? "プレビューを停止しています…" : "録画を保存しています…";
             UpdateControls();
         } catch (IOException error) { status.Text = error.Message; }
     }
@@ -336,12 +361,18 @@ sealed class StreamSmashWindow : Form
             }
         }
         if (!engine.HasExited || Interlocked.CompareExchange(ref closedPipes, 0, 0) != 2 || !messages.IsEmpty) return;
+        bool wasCapture = recording || previewing;
+        bool beginRecording = recordAfterPreview && !closing;
         status.Text = engine.ExitCode == 0
-            ? (recording ? "録画を保存しました" : string.Format("映像機器 {0} 台・音声機器 {1} 台", source.Items.Count, audio.Items.Count))
+            ? (recording ? "録画を保存しました" : previewing ? "プレビューを停止しました" : string.Format("映像機器 {0} 台・音声機器 {1} 台", source.Items.Count, audio.Items.Count))
             : "処理に失敗しました。詳細はログを確認してください。";
         engine.Dispose();
         engine = null;
+        previewing = false;
+        recordAfterPreview = false;
+        if (wasCapture) preview.End();
         UpdateControls();
         if (closing) Close();
+        else if (beginRecording) StartCapture(false);
     }
 }

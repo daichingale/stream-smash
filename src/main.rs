@@ -29,8 +29,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             session::list_devices(names_only)?;
         }
-        Some("record") => {
-            let mut session = Session::default();
+        Some(action @ ("record" | "preview")) => {
+            let mut session = Session {
+                preview_only: action == "preview",
+                ..Session::default()
+            };
             let mut input = None;
             let mut audio = None;
             while let Some(flag) = args.next() {
@@ -96,6 +99,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         session.audio_peaks = true;
                         None
                     }
+                    "--preview-image" => {
+                        session.preview_image = Some(value()?.into());
+                        None
+                    }
                     _ => {
                         return Err(
                             format!("Unknown option {flag}. See stream-smash --help.").into()
@@ -133,6 +140,8 @@ fn print_help() {
          record --test-pattern          Record a generated picture and tone\n\
          record --video-device NAME     Record a Windows capture device\n\
          record --input FILE            Record a media file at playback speed\n\n\
+         preview --test-pattern --preview-image PATH   Preview without recording\n\
+         Add --preview-image PATH to record for a live JPEG preview.\n\n\
          Options: --audio-device NAME, --size WIDTHxHEIGHT, --fps N,\n\
                   --seconds N, --output-dir PATH, --stream, --highlights 10|30|60\n\
          --capture-size WIDTHxHEIGHT|auto (DirectShow only)\n\

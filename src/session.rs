@@ -45,6 +45,8 @@ pub struct Session {
     pub quality: Quality,
     pub bitrate: u32,
     pub capture_size: CaptureSize,
+    pub preview_image: Option<PathBuf>,
+    pub preview_only: bool,
 }
 
 impl Default for Session {
@@ -62,6 +64,8 @@ impl Default for Session {
             quality: Quality::Balanced,
             bitrate: 6000,
             capture_size: CaptureSize::MatchOutput,
+            preview_image: None,
+            preview_only: false,
         }
     }
 }
@@ -91,6 +95,30 @@ impl Session {
         if self.audio_peaks && self.highlight_seconds.is_none() {
             return Err("--audio-peaks requires --highlights".into());
         }
+        let preview = self
+            .preview_image
+            .as_ref()
+            .map(std::path::absolute)
+            .transpose()?;
+        if preview.as_ref().is_some_and(|path| {
+            path.exists() || !path.parent().is_some_and(|parent| parent.is_dir())
+        }) {
+            return Err("Preview image must be a new file in an existing directory".into());
+        }
+        if self.preview_only {
+            let preview = preview.as_ref().ok_or("Preview requires --preview-image")?;
+            if self.stream || self.highlight_seconds.is_some() {
+                return Err("Preview does not accept streaming or highlights".into());
+            }
+            let mut command = ffmpeg();
+            command.args(["-hide_banner", "-loglevel", "warning", "-nostats", "-n"]);
+            self.add_input(&mut command, false)?;
+            self.add_preview(&mut command, preview);
+            if !command.status()?.success() {
+                return Err("FFmpeg could not start the preview".into());
+            }
+            return Ok(());
+        }
         let url = if self.stream {
             let url = env::var("STREAM_SMASH_RTMP_URL")
                 .map_err(|_| "Set STREAM_SMASH_RTMP_URL before using --stream")?;
@@ -109,7 +137,8 @@ impl Session {
             "-progress",
             "pipe:1",
         ]);
-        self.add_input(&mut command)?;
+        let audio_map = self.add_input(&mut command, true)?;
+        command.args(["-map", "0:v:0", "-map", audio_map]);
         if self.audio_peaks {
             command.args(["-af", AudioPeaks::FILTER]);
         }
@@ -171,6 +200,9 @@ impl Session {
             command.args(["-f", "tee", &output]);
         } else {
             command.arg(&name);
+        }
+        if let Some(preview) = preview.as_ref() {
+            self.add_preview(&mut command, preview);
         }
         command
             .current_dir(&output_dir)
@@ -289,27 +321,59 @@ impl Session {
         }
     }
 
-    fn add_input(&self, command: &mut Command) -> Result<()> {
+    fn add_preview(&self, command: &mut Command, path: &std::path::Path) {
+        let (width, height) = self.size;
+        let scale = (640.0 / f64::from(width))
+            .min(360.0 / f64::from(height))
+            .min(1.0);
+        let preview_width = ((f64::from(width) * scale) as u16 & !1).max(2);
+        let preview_height = ((f64::from(height) * scale) as u16 & !1).max(2);
+        let fps = self.fps.min(12);
+        let filter = format!(
+            "fps={fps},scale={preview_width}:{preview_height}:flags=fast_bilinear:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,pad={preview_width}:{preview_height}:(ow-iw)/2:(oh-ih)/2"
+        );
+        if let Some(seconds) = self.seconds {
+            command.args(["-t", &seconds.to_string()]);
+        }
+        command
+            .args([
+                "-map",
+                "0:v:0",
+                "-an",
+                "-vf",
+                &filter,
+                "-c:v",
+                "mjpeg",
+                "-threads:v",
+                "1",
+                "-q:v",
+                "6",
+                "-f",
+                "image2",
+                "-update",
+                "1",
+                "-atomic_writing",
+                "1",
+            ])
+            .arg(path);
+    }
+
+    fn add_input(&self, command: &mut Command, with_audio: bool) -> Result<&'static str> {
         match &self.input {
             Input::TestPattern => {
                 let (width, height) = self.size;
                 let video = format!("testsrc2=size={width}x{height}:rate={}", self.fps);
-                command.args([
-                    "-re",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &video,
-                    "-re",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:sample_rate=48000",
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0",
-                ]);
+                command.args(["-re", "-f", "lavfi", "-i", &video]);
+                if with_audio {
+                    command.args([
+                        "-re",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "sine=frequency=440:sample_rate=48000",
+                    ]);
+                }
+                return Ok("1:a:0");
             }
             Input::DirectShow(video, audio) => {
                 if !cfg!(windows) {
@@ -326,7 +390,7 @@ impl Session {
                     );
                 }
                 let mut devices = format!("video={video}");
-                if let Some(audio) = audio {
+                if with_audio && let Some(audio) = audio {
                     devices.push_str(&format!(":audio={audio}"));
                 }
                 command.args(["-f", "dshow", "-rtbufsize", "256M"]);
@@ -338,14 +402,13 @@ impl Session {
                         &self.fps.to_string(),
                     ]);
                 }
-                command.args(["-i", &devices, "-map", "0:v:0", "-map", "0:a:0?"]);
+                command.args(["-i", &devices]);
             }
             Input::File(path) => {
                 command.args(["-re", "-i"]).arg(path.canonicalize()?);
-                command.args(["-map", "0:v:0", "-map", "0:a:0?"]);
             }
         }
-        Ok(())
+        Ok("0:a:0?")
     }
 }
 
