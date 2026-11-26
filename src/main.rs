@@ -103,6 +103,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         session.preview_image = Some(value()?.into());
                         None
                     }
+                    "--preview-port" => {
+                        session.preview_port = Some(value()?.parse()?);
+                        None
+                    }
                     "--preview-size" => {
                         session.preview_size = parse_size(&value()?)?;
                         None
@@ -162,6 +166,7 @@ fn print_help() {
          record --input FILE            Record a media file at playback speed\n\n\
          preview --test-pattern --preview-image PATH   Preview without recording\n\
          Add --preview-image PATH to record for a live JPEG preview.\n\n\
+         --preview-port PORT sends fixed-size BGRA frames to a loopback reader.\n\n\
          --preview-size WIDTHxHEIGHT, --preview-fps 1-60, --preview-quality 1-100\n\
          --overlay PNG overlays a full-canvas image; --overlay-opacity 0-100\n\n\
          Options: --audio-device NAME, --size WIDTHxHEIGHT, --fps N,\n\

@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
-using System.IO;
+using System.Drawing.Imaging;
+using System.Threading;
 using System.Windows.Forms;
 
 sealed class PreviewPane : Panel
@@ -12,12 +14,14 @@ sealed class PreviewPane : Panel
     readonly Button detach = new Button { Text = "別ウィンドウ", AutoSize = true };
     readonly CheckBox topmost = new CheckBox { Text = "最前面", AutoSize = true, Enabled = false, Padding = new Padding(4) };
     readonly ComboBox resolution = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
-    readonly NumericUpDown fps = new NumericUpDown { Minimum = 1, Maximum = 60, Value = 12, Width = 57 };
-    readonly NumericUpDown quality = new NumericUpDown { Minimum = 1, Maximum = 100, Value = 84, Width = 57 };
+    readonly NumericUpDown fps = new NumericUpDown { Minimum = 1, Maximum = 60, Value = 30, Width = 57 };
+    readonly ComboBox quality = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 92 };
     readonly Label state = new Label { Text = "入力を選び、プレビュー開始を押してください。", Dock = DockStyle.Bottom, Height = 30 };
     Form floating;
-    string imagePath;
-    DateTime latest;
+    PreviewFeed feed;
+    Bitmap frame;
+    readonly Stopwatch displayClock = new Stopwatch();
+    int displayed, scheduled;
 
     public PreviewPane()
     {
@@ -28,10 +32,12 @@ sealed class PreviewPane : Panel
         actions.Controls.AddRange(new Control[] { detach, topmost });
         resolution.Items.AddRange(new object[] { "426x240", "640x360", "960x540", "1280x720", "1920x1080" });
         resolution.SelectedIndex = 1;
+        quality.Items.AddRange(new object[] { "軽量", "精細" });
+        quality.SelectedIndex = 0;
         var settings = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true };
         settings.Controls.AddRange(new Control[] {
             Caption("解像度", resolution), resolution, Caption("fps", fps), fps,
-            Caption("JPEG画質", quality), quality
+            Caption("拡縮品質", quality), quality
         });
         Controls.Add(dock);
         Controls.Add(state);
@@ -58,13 +64,11 @@ sealed class PreviewPane : Panel
         set { resolution.Enabled = fps.Enabled = quality.Enabled = value; }
     }
 
-    public int RefreshInterval { get { return Math.Max(15, 800 / (int)fps.Value); } }
-
     public string[] Arguments()
     {
         return new[] {
-            "--preview-image", ImagePath, "--preview-size", resolution.Text,
-            "--preview-fps", fps.Value.ToString(), "--preview-quality", quality.Value.ToString()
+            "--preview-port", feed.Port.ToString(), "--preview-size", resolution.Text,
+            "--preview-fps", fps.Value.ToString(), "--preview-quality", quality.SelectedIndex == 0 ? "84" : "95"
         };
     }
 
@@ -90,57 +94,57 @@ sealed class PreviewPane : Panel
     public void Begin()
     {
         End();
-        imagePath = Path.Combine(Path.GetTempPath(), "StreamSmash-" + Guid.NewGuid().ToString("N") + ".jpg");
+        var dimensions = resolution.Text.Split('x');
+        int width = int.Parse(dimensions[0]), height = int.Parse(dimensions[1]);
+        feed = new PreviewFeed(width, height, QueueFrame);
+        frame = new Bitmap(width, height, PixelFormat.Format32bppRgb);
+        displayed = 0;
+        displayClock.Reset();
         state.Text = "映像を待っています…";
     }
 
-    public string ImagePath { get { return imagePath; } }
-
-    public void ReadFrame()
+    void QueueFrame()
     {
-        if (imagePath == null || !picture.Visible) return;
+        if (Interlocked.Exchange(ref scheduled, 1) != 0) return;
         try {
-            DateTime modified = File.GetLastWriteTimeUtc(imagePath);
-            if (modified == latest) return;
-            using (var file = new FileStream(imagePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            using (var decoded = Image.FromStream(file)) {
-                ReplaceImage(new Bitmap(decoded));
+            BeginInvoke((MethodInvoker)delegate {
+                Interlocked.Exchange(ref scheduled, 0);
+                if (!IsDisposed) ReadFrame();
+            });
+        } catch (InvalidOperationException) {
+            Interlocked.Exchange(ref scheduled, 0);
+        }
+    }
+
+    void ReadFrame()
+    {
+        if (feed == null || !picture.Visible) return;
+        if (feed.ReadLatest(frame)) {
+            if (picture.Image == null) {
+                picture.Image = frame;
+                state.Text = "出力プレビュー";
+                displayClock.Start();
             }
-            latest = modified;
-            state.Text = "出力映像のプレビュー";
-        } catch (IOException) {
-            // The first frame may not exist yet, or FFmpeg may be replacing it.
-        } catch (ArgumentException) {
-            // An incomplete frame is skipped until the next refresh.
-        } catch (UnauthorizedAccessException) {
-            state.Text = "プレビュー画像を読み込めません。";
+            picture.Invalidate();
+            displayed++;
+        }
+        if (feed.Disconnected) {
+            state.Text = "プレビュー接続が終了しました。";
+        } else if (displayClock.ElapsedMilliseconds >= 1000) {
+            state.Text = string.Format("出力プレビュー  •  表示更新 {0:F1} fps", displayed / displayClock.Elapsed.TotalSeconds);
+            displayed = 0;
+            displayClock.Restart();
         }
     }
 
     public void End()
     {
-        if (imagePath != null) {
-            DeleteFrame(imagePath);
-            DeleteFrame(imagePath + ".tmp");
-        }
-        imagePath = null;
-        latest = DateTime.MinValue;
-        ReplaceImage(null);
+        if (feed != null) feed.Dispose();
+        feed = null;
+        picture.Image = null;
+        if (frame != null) frame.Dispose();
+        frame = null;
         state.Text = "入力を選び、プレビュー開始を押してください。";
-    }
-
-    static void DeleteFrame(string path)
-    {
-        try { File.Delete(path); }
-        catch (IOException) {}
-        catch (UnauthorizedAccessException) {}
-    }
-
-    void ReplaceImage(Image image)
-    {
-        var previous = picture.Image;
-        picture.Image = image;
-        if (previous != null) previous.Dispose();
     }
 
     protected override void Dispose(bool disposing)

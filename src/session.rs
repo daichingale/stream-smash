@@ -46,6 +46,7 @@ pub struct Session {
     pub bitrate: u32,
     pub capture_size: CaptureSize,
     pub preview_image: Option<PathBuf>,
+    pub preview_port: Option<u16>,
     pub preview_only: bool,
     pub preview_size: (u16, u16),
     pub preview_fps: u16,
@@ -70,9 +71,10 @@ impl Default for Session {
             bitrate: 6000,
             capture_size: CaptureSize::MatchOutput,
             preview_image: None,
+            preview_port: None,
             preview_only: false,
             preview_size: (640, 360),
-            preview_fps: 12,
+            preview_fps: 30,
             preview_quality: 84,
             overlay: None,
             overlay_opacity: 100,
@@ -125,13 +127,19 @@ impl Session {
             .as_ref()
             .map(std::path::absolute)
             .transpose()?;
+        if self.preview_port == Some(0) || (preview.is_some() && self.preview_port.is_some()) {
+            return Err("Choose either --preview-image or a nonzero --preview-port".into());
+        }
+        let has_preview = preview.is_some() || self.preview_port.is_some();
         if preview.as_ref().is_some_and(|path| {
             path.exists() || !path.parent().is_some_and(|parent| parent.is_dir())
         }) {
             return Err("Preview image must be a new file in an existing directory".into());
         }
         if self.preview_only {
-            let preview = preview.as_ref().ok_or("Preview requires --preview-image")?;
+            if !has_preview {
+                return Err("Preview requires --preview-image or --preview-port".into());
+            }
             if self.stream || self.highlight_seconds.is_some() {
                 return Err("Preview does not accept streaming or highlights".into());
             }
@@ -141,7 +149,7 @@ impl Session {
             if let Some(overlay) = overlay.as_ref() {
                 self.add_overlay(&mut command, overlay, false, true);
             }
-            self.add_preview(&mut command, preview, overlay.is_some());
+            self.add_preview(&mut command, preview.as_deref(), overlay.is_some());
             if !command.status()?.success() {
                 return Err("FFmpeg could not start the preview".into());
             }
@@ -167,7 +175,7 @@ impl Session {
         ]);
         let audio_map = self.add_input(&mut command, true)?;
         if let Some(overlay) = overlay.as_ref() {
-            self.add_overlay(&mut command, overlay, true, preview.is_some());
+            self.add_overlay(&mut command, overlay, true, has_preview);
         }
         command.args([
             "-map",
@@ -237,8 +245,8 @@ impl Session {
         } else {
             command.arg(&name);
         }
-        if let Some(preview) = preview.as_ref() {
-            self.add_preview(&mut command, preview, overlay.is_some());
+        if has_preview {
+            self.add_preview(&mut command, preview.as_deref(), overlay.is_some());
         }
         command
             .current_dir(&output_dir)
@@ -400,8 +408,14 @@ impl Session {
         let scale = (f64::from(self.preview_size.0) / f64::from(width))
             .min(f64::from(self.preview_size.1) / f64::from(height))
             .min(1.0);
-        let preview_width = ((f64::from(width) * scale) as u16 & !1).max(2);
-        let preview_height = ((f64::from(height) * scale) as u16 & !1).max(2);
+        let (preview_width, preview_height) = if self.preview_port.is_some() {
+            self.preview_size
+        } else {
+            (
+                ((f64::from(width) * scale) as u16 & !1).max(2),
+                ((f64::from(height) * scale) as u16 & !1).max(2),
+            )
+        };
         let fps = self.fps.min(self.preview_fps);
         let scaler = if self.preview_quality >= 90 {
             "lanczos"
@@ -413,13 +427,32 @@ impl Session {
         )
     }
 
-    fn add_preview(&self, command: &mut Command, path: &Path, composited: bool) {
+    fn add_preview(&self, command: &mut Command, path: Option<&Path>, composited: bool) {
         if let Some(seconds) = self.seconds {
             command.args(["-t", &seconds.to_string()]);
         }
         command.args(["-map", if composited { "[preview]" } else { "0:v:0" }]);
         if !composited {
             command.args(["-vf", &self.preview_filter()]);
+        }
+        if let Some(port) = self.preview_port {
+            // Queue complete frames separately so a slow or closed viewer cannot hold up recording.
+            let output = format!(
+                "[onfail=ignore:f=fifo:fifo_format=rawvideo:queue_size=2:drop_pkts_on_overflow=1]tcp://127.0.0.1:{port}?timeout=300000|[f=null]-"
+            );
+            command.args([
+                "-an",
+                "-c:v",
+                "rawvideo",
+                "-pix_fmt",
+                "bgra",
+                "-threads:v",
+                "1",
+                "-f",
+                "tee",
+                &output,
+            ]);
+            return;
         }
         let quantizer = 2 + (100 - self.preview_quality) / 4;
         command
@@ -438,7 +471,7 @@ impl Session {
                 "-atomic_writing",
                 "1",
             ])
-            .arg(path);
+            .arg(path.expect("JPEG preview path"));
     }
 
     fn add_input(&self, command: &mut Command, with_audio: bool) -> Result<&'static str> {

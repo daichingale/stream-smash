@@ -192,11 +192,9 @@ sealed class StreamSmashWindow : Form
             StopRecording();
         };
         FormClosed += (sender, args) => timer.Dispose();
-        timer.Tick += (sender, args) => {
-            preview.ReadFrame();
-            ReadActivity();
-        };
+        timer.Tick += (sender, args) => ReadActivity();
         StudioColors.Apply(this);
+        title.ForeColor = StudioColors.Accent;
         StudioColors.Primary(start);
         UpdateControls();
         timer.Start();
@@ -287,9 +285,14 @@ sealed class StreamSmashWindow : Form
         if (overlay.Text.Length > 0)
             args.AddRange(new[] { "--overlay", overlay.Text, "--overlay-opacity", opacity.Value.ToString() });
         if (onlyPreview || livePreview.Checked) {
-            preview.Begin();
-            args.AddRange(preview.Arguments());
-            timer.Interval = preview.RefreshInterval;
+            try {
+                preview.Begin();
+                args.AddRange(preview.Arguments());
+            } catch (System.Net.Sockets.SocketException error) {
+                preview.End();
+                if (onlyPreview) { status.Text = "プレビューを開始できませんでした。"; return; }
+                encoderStatus.Text = error.Message;
+            }
         }
         Launch(args, !onlyPreview, destination, onlyPreview);
         if (engine == null) preview.End();
@@ -411,7 +414,6 @@ sealed class StreamSmashWindow : Form
         previewing = false;
         recordAfterPreview = false;
         if (wasCapture) preview.End();
-        timer.Interval = 50;
         UpdateControls();
         if (closing) Close();
         else if (beginRecording) StartCapture(false);
