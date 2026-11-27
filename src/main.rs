@@ -99,6 +99,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                         session.audio_peaks = true;
                         None
                     }
+                    "--audio-volume" => {
+                        session.audio_volume = value()?.parse()?;
+                        None
+                    }
+                    "--audio-meter" => {
+                        session.audio_meter = true;
+                        None
+                    }
                     "--preview-image" => {
                         session.preview_image = Some(value()?.into());
                         None
@@ -125,6 +133,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                     }
                     "--overlay-opacity" => {
                         session.overlay_opacity = value()?.parse()?;
+                        None
+                    }
+                    "--camera-url" | "--camera-file" => {
+                        if session.camera.is_some() {
+                            return Err("Select only one secondary camera source".into());
+                        }
+                        let value = value()?;
+                        session.camera = Some(if flag == "--camera-url" {
+                            session::Camera::Network(value)
+                        } else {
+                            session::Camera::File(value.into())
+                        });
                         None
                     }
                     _ => {
@@ -167,6 +187,8 @@ fn print_help() {
          preview --test-pattern --preview-image PATH   Preview without recording\n\
          Add --preview-image PATH to record for a live JPEG preview.\n\n\
          --preview-port PORT sends fixed-size BGRA frames to a loopback reader.\n\n\
+         --camera-url URL adds a local MJPEG or RTSP inset. --camera-file FILE uses a local video.\n\
+         --audio-volume 0-100 adjusts recording audio. --audio-meter prints level updates.\n\n\
          --preview-size WIDTHxHEIGHT, --preview-fps 1-60, --preview-quality 1-100\n\
          --overlay PNG overlays a full-canvas image; --overlay-opacity 0-100\n\n\
          Options: --audio-device NAME, --size WIDTHxHEIGHT, --fps N,\n\

@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fs,
     io::{self, BufRead, BufReader, Write},
-    net::UdpSocket,
+    net::{Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -25,6 +25,57 @@ pub enum Input {
     File(PathBuf),
 }
 
+pub enum Camera {
+    Network(String),
+    File(PathBuf),
+}
+
+impl Camera {
+    fn add_input(&self, command: &mut Command) -> Result<()> {
+        command.args(["-thread_queue_size", "16"]);
+        match self {
+            Self::File(path) => {
+                command.args(["-re", "-i"]).arg(path.canonicalize()?);
+            }
+            Self::Network(url) => {
+                let (protocol, address) = url
+                    .split_once("://")
+                    .ok_or("Use http:// or rtsp:// for the camera")?;
+                let host = address.split('/').next().unwrap_or("");
+                let (ip, port) = host.rsplit_once(':').unwrap_or((host, ""));
+                let ip: Ipv4Addr = ip
+                    .parse()
+                    .map_err(|_| "Use the camera's local IPv4 address")?;
+                if !(ip.is_private() || ip.is_loopback())
+                    || url.chars().any(|c| c.is_whitespace() || c.is_control())
+                    || address.contains(['@', '#'])
+                    || (!port.is_empty() && port.parse::<u16>().ok().filter(|n| *n > 0).is_none())
+                {
+                    return Err("Use a private IPv4 camera URL without credentials".into());
+                }
+                match protocol {
+                    "http" => {
+                        command.args(["-rw_timeout", "3000000", "-f", "mpjpeg"]);
+                    }
+                    "rtsp" => {
+                        command.args([
+                            "-rtsp_transport",
+                            "tcp",
+                            "-timeout",
+                            "3000000",
+                            "-f",
+                            "rtsp",
+                        ]);
+                    }
+                    _ => return Err("Use HTTP multipart JPEG or RTSP for the camera".into()),
+                }
+                command.args(["-i", url]);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum CaptureSize {
     MatchOutput,
@@ -41,6 +92,8 @@ pub struct Session {
     pub stream: bool,
     pub highlight_seconds: Option<u16>,
     pub audio_peaks: bool,
+    pub audio_meter: bool,
+    pub audio_volume: u16,
     pub encoder: Encoder,
     pub quality: Quality,
     pub bitrate: u32,
@@ -53,6 +106,7 @@ pub struct Session {
     pub preview_quality: u8,
     pub overlay: Option<PathBuf>,
     pub overlay_opacity: u8,
+    pub camera: Option<Camera>,
 }
 
 impl Default for Session {
@@ -66,6 +120,8 @@ impl Default for Session {
             stream: false,
             highlight_seconds: None,
             audio_peaks: false,
+            audio_meter: false,
+            audio_volume: 100,
             encoder: Encoder::Cpu,
             quality: Quality::Balanced,
             bitrate: 6000,
@@ -78,6 +134,7 @@ impl Default for Session {
             preview_quality: 84,
             overlay: None,
             overlay_opacity: 100,
+            camera: None,
         }
     }
 }
@@ -107,6 +164,9 @@ impl Session {
         if self.audio_peaks && self.highlight_seconds.is_none() {
             return Err("--audio-peaks requires --highlights".into());
         }
+        if self.audio_volume > 100 {
+            return Err("Use --audio-volume between 0 and 100".into());
+        }
         if !valid_size(self.preview_size)
             || self.preview_size.0 > 1920
             || self.preview_size.1 > 1080
@@ -122,6 +182,7 @@ impl Session {
             return Err("Use --overlay-opacity between 0 and 100".into());
         }
         let overlay = self.overlay.as_deref().map(validate_overlay).transpose()?;
+        let composited = self.camera.is_some() || overlay.is_some();
         let preview = self
             .preview_image
             .as_ref()
@@ -146,10 +207,10 @@ impl Session {
             let mut command = ffmpeg();
             command.args(["-hide_banner", "-loglevel", "warning", "-nostats", "-n"]);
             self.add_input(&mut command, false)?;
-            if let Some(overlay) = overlay.as_ref() {
-                self.add_overlay(&mut command, overlay, false, true);
+            if composited {
+                self.add_composition(&mut command, overlay.as_deref(), false, true)?;
             }
-            self.add_preview(&mut command, preview.as_deref(), overlay.is_some());
+            self.add_preview(&mut command, preview.as_deref(), composited);
             if !command.status()?.success() {
                 return Err("FFmpeg could not start the preview".into());
             }
@@ -174,26 +235,28 @@ impl Session {
             "pipe:1",
         ]);
         let audio_map = self.add_input(&mut command, true)?;
-        if let Some(overlay) = overlay.as_ref() {
-            self.add_overlay(&mut command, overlay, true, has_preview);
+        if composited {
+            self.add_composition(&mut command, overlay.as_deref(), true, has_preview)?;
         }
         command.args([
             "-map",
-            if overlay.is_some() {
-                "[program]"
-            } else {
-                "0:v:0"
-            },
+            if composited { "[program]" } else { "0:v:0" },
             "-map",
             audio_map,
         ]);
-        if self.audio_peaks {
-            command.args(["-af", AudioPeaks::FILTER]);
+        let track_audio = self.audio_peaks || self.audio_meter;
+        if track_audio || self.audio_volume != 100 {
+            let mut filter = format!("volume={}", f64::from(self.audio_volume) / 100.0);
+            if track_audio {
+                filter.push(',');
+                filter.push_str(AudioPeaks::FILTER);
+            }
+            command.args(["-af", &filter]);
         }
         if let Some(seconds) = self.seconds {
             command.args(["-t", &seconds.to_string()]);
         }
-        if overlay.is_none() && self.needs_scaling() {
+        if !composited && self.needs_scaling() {
             command.args(["-vf", &self.program_filter()]);
         }
         let encoder = self
@@ -246,7 +309,7 @@ impl Session {
             command.arg(&name);
         }
         if has_preview {
-            self.add_preview(&mut command, preview.as_deref(), overlay.is_some());
+            self.add_preview(&mut command, preview.as_deref(), composited);
         }
         command
             .current_dir(&output_dir)
@@ -299,14 +362,21 @@ impl Session {
         let result = thread::scope(|scope| {
             let diagnostics = scope.spawn(|| {
                 let mut peaks = AudioPeaks::default();
+                let mut meter_samples = 0;
                 for line in BufReader::new(stderr)
                     .lines()
                     .map_while(std::result::Result::ok)
                 {
-                    if self.audio_peaks {
+                    if track_audio {
                         if let Some(level) = line.strip_prefix("lavfi.astats.Overall.RMS_level=") {
-                            if level.parse().is_ok_and(|level| peaks.update(level)) {
-                                let _ = save.try_send(Request::AudioPeak);
+                            if let Ok(level) = level.parse::<f64>() {
+                                if self.audio_peaks && peaks.update(level) {
+                                    let _ = save.try_send(Request::AudioPeak);
+                                }
+                                meter_samples += 1;
+                                if self.audio_meter && meter_samples % 3 == 0 {
+                                    println!("Audio level: {:.1}", level.max(-60.0));
+                                }
                             }
                             continue;
                         }
@@ -373,9 +443,15 @@ impl Session {
         )
     }
 
-    fn add_overlay(&self, command: &mut Command, path: &Path, recording: bool, preview: bool) {
+    fn add_composition(
+        &self,
+        command: &mut Command,
+        overlay: Option<&Path>,
+        recording: bool,
+        preview: bool,
+    ) -> Result<()> {
         let (width, height) = self.size;
-        let index = if recording && matches!(self.input, Input::TestPattern) {
+        let mut index = if recording && matches!(self.input, Input::TestPattern) {
             2
         } else {
             1
@@ -394,13 +470,34 @@ impl Session {
             (true, false) => "[program]".into(),
             (false, _) => format!(",{}[preview]", self.preview_filter()),
         };
-        let graph = format!(
-            "[0:v:0]{input}[base];[{index}:v:0]scale={width}:{height}:flags=bilinear,format=rgba,colorchannelmixer=aa={opacity}[art];[base][art]overlay=alpha=straight:eof_action=repeat{outputs}"
-        );
-        command
-            .args(["-f", "image2", "-pattern_type", "none", "-c:v", "png", "-i"])
-            .arg(path);
+        let mut graph = format!("[0:v:0]{input}[base];");
+        let mut base = "[base]";
+        if let Some(path) = overlay {
+            command
+                .args(["-f", "image2", "-pattern_type", "none", "-c:v", "png", "-i"])
+                .arg(path);
+            graph.push_str(&format!(
+                "[{index}:v:0]scale={width}:{height}:flags=bilinear,format=rgba,colorchannelmixer=aa={opacity}[art];[base][art]overlay=alpha=straight:eof_action=repeat"
+            ));
+            index += 1;
+            base = "[with_art]";
+        }
+        if let Some(camera) = self.camera.as_ref() {
+            camera.add_input(command)?;
+            let inset_width = ((width / 4) & !1).max(2);
+            let inset_height = ((height / 4) & !1).max(2);
+            let margin = (width / 100).min(height / 8);
+            if overlay.is_some() {
+                graph.push_str("[with_art];");
+            }
+            let fit = square_fit(inset_width, inset_height, "fast_bilinear");
+            graph.push_str(&format!(
+                "[{index}:v:0]fps=24,{fit}[inset];{base}[inset]overlay=x='max(0,W-w-{margin})':y='max(0,H-h-{margin})':eof_action=pass"
+            ));
+        }
+        graph.push_str(&outputs);
         command.args(["-filter_complex", &graph]);
+        Ok(())
     }
 
     fn preview_filter(&self) -> String {
@@ -422,9 +519,8 @@ impl Session {
         } else {
             "fast_bilinear"
         };
-        format!(
-            "fps={fps},scale={preview_width}:{preview_height}:flags={scaler}:force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,pad={preview_width}:{preview_height}:(ow-iw)/2:(oh-ih)/2"
-        )
+        let fit = square_fit(preview_width, preview_height, scaler);
+        format!("fps={fps},{fit},pad={preview_width}:{preview_height}:(ow-iw)/2:(oh-ih)/2")
     }
 
     fn add_preview(&self, command: &mut Command, path: Option<&Path>, composited: bool) {
@@ -528,6 +624,12 @@ impl Session {
     }
 }
 
+fn square_fit(width: u16, height: u16, scaler: &str) -> String {
+    format!(
+        "scale=w='max(2,min({width},trunc({height}*dar/2)*2))':h='max(2,min({height},trunc({width}/dar/2)*2))':flags={scaler},setsar=1"
+    )
+}
+
 fn validate_overlay(path: &Path) -> Result<PathBuf> {
     use io::Read;
     let path = path.canonicalize()?;
@@ -537,11 +639,11 @@ fn validate_overlay(path: &Path) -> Result<PathBuf> {
         || file.read_exact(&mut header).is_err()
         || &header[..8] != b"\x89PNG\r\n\x1a\n"
         || &header[12..16] != b"IHDR"
-        || header[16..24].chunks_exact(4).any(|bytes| {
-            !(1..=4096).contains(&u32::from_be_bytes(
-                bytes.try_into().expect("4-byte PNG dimension"),
-            ))
-        })
+        || header[16..24]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|bytes| !(1..=4096).contains(&u32::from_be_bytes(*bytes)))
     {
         return Err("Overlay must be a PNG up to 4096x4096 and 32 MiB".into());
     }

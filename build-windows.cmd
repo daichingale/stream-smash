@@ -9,7 +9,7 @@ if not exist "%csc%" (
     echo Windows .NET Framework compiler not found.
     goto fail
 )
-"%csc%" /nologo /codepage:65001 /optimize+ /target:winexe /out:target\release\StreamSmash.exe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll windows\Launcher.cs windows\PreviewPane.cs windows\PreviewFeed.cs windows\StudioColors.cs windows\ProcessUsage.cs
+"%csc%" /nologo /codepage:65001 /optimize+ /target:winexe /out:target\release\StreamSmash.exe /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /resource:windows\mobile.html,StreamSmash.Mobile windows\Launcher.cs windows\PreviewPane.cs windows\PreviewFeed.cs windows\StudioColors.cs windows\ProcessUsage.cs windows\MobileRemote.cs windows\MobilePairing.cs windows\PairingQr.cs
 if errorlevel 1 goto fail
 echo Built target\release\StreamSmash.exe
 popd

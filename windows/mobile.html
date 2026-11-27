@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stream Smash リモコン</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#0d1524;color:#eef5ff}*{box-sizing:border-box}body{margin:0 auto;max-width:36rem;padding:1.2rem}header{border-bottom:1px solid #35435b;margin-bottom:1rem}h1{font-size:1.6rem}p{line-height:1.55}.status{padding:1rem;background:#1b2940;border-radius:1rem;min-height:4rem;overflow-wrap:anywhere}button{font:inherit;color:inherit;background:#253854;border:1px solid #526886;border-radius:.7rem;padding:1rem .65rem;min-height:55px}button:disabled{opacity:.5}button[data-path="/clip"]{background:#095d54;border-color:#69c9af;font-weight:bold;grid-column:span 2}button[data-path="/stop"]{background:#642c42}.controls{display:grid;grid-template-columns:1fr 1fr;gap:.6rem;margin:1rem 0}img{width:100%;aspect-ratio:16/9;object-fit:contain;background:#050a12;border-radius:.6rem}details{margin-top:1rem}summary{padding:.55rem 0}#message{min-height:1.6rem;color:#9cddfa}
+</style>
+<header><h1>Stream Smash リモコン</h1></header>
+<div class="status"><strong id="state">PCに接続しています…</strong><div id="details"></div></div>
+<div class="controls">
+  <button data-path="/clip" disabled>見せ場を保存</button>
+  <button data-path="/record" disabled>録画開始</button>
+  <button data-path="/stream" disabled>録画とRTMP配信を開始</button>
+  <button data-path="/preview-start" disabled>プレビュー開始</button>
+  <button data-path="/stop" disabled>停止</button>
+</div>
+<div id="message" aria-live="polite"></div>
+<details id="monitor"><summary>映像を確認（約1fps）</summary><img id="image" alt="Stream Smashの現在の映像"></details>
+<script>
+const key = location.hash.slice(1);
+const $ = id => document.getElementById(id);
+const buttons = [...document.querySelectorAll('[data-path]')];
+let permitted = [], sending = false, imageUrl;
+function controls(){ for(const b of buttons) b.disabled = sending || !permitted.includes(b.dataset.path); }
+function request(path, method = 'GET') {
+  return fetch(path, {method, cache:'no-store', headers:{'X-Stream-Smash-Key':key}});
+}
+async function poll() {
+  if (!key) { $('state').textContent='PCに表示されたペアリングURLを開いてください。'; return; }
+  try {
+    if (!document.hidden) {
+      const r = await request('/status');
+      if (r.status === 403) { $('state').textContent='PCの画面でペアリングし直してください。'; permitted=[]; controls(); return; }
+      if (!r.ok) throw Error();
+      const s = await r.json();
+      $('state').textContent=s.state;
+      $('details').textContent=s.metrics;
+      $('message').textContent=s.result;
+      permitted=s.actions;
+      controls();
+      if ($('monitor').open) {
+        const picture = await request('/preview');
+        if (picture.status === 200) {
+          const next = URL.createObjectURL(await picture.blob());
+          $('image').src=next;
+          if (imageUrl) URL.revokeObjectURL(imageUrl);
+          imageUrl=next;
+        } else if (picture.status === 204 && imageUrl) {
+          $('image').removeAttribute('src'); URL.revokeObjectURL(imageUrl); imageUrl=undefined;
+        }
+      }
+    }
+  } catch (_) { $('state').textContent='接続を待っています…'; permitted=[]; controls(); }
+  setTimeout(poll, 1000);
+}
+for (const b of buttons) b.onclick = async () => {
+  if (sending) return;
+  sending=true; controls();
+  try { const r=await request(b.dataset.path,'POST'); if (!r.ok) throw Error(); $('message').textContent='PCへ操作を送りました。'; }
+  catch (_) { $('message').textContent='操作できませんでした。接続を確認してください。'; }
+  finally { sending=false; permitted=[]; controls(); }
+};
+poll();
+</script>
+</html>

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -24,6 +25,9 @@ sealed class PreviewPane : Panel
     Bitmap frame;
     readonly Stopwatch displayClock = new Stopwatch();
     int displayed, scheduled;
+    int mobileRequested;
+    volatile byte[] mobileImage;
+    readonly Stopwatch mobileClock = Stopwatch.StartNew();
 
     public PreviewPane()
     {
@@ -72,6 +76,22 @@ sealed class PreviewPane : Panel
             "--preview-port", feed.Port.ToString(), "--preview-size", resolution.Text,
             "--preview-fps", fps.Value.ToString(), "--preview-quality", quality.SelectedIndex == 0 ? "84" : "95"
         };
+    }
+
+    public void StoreSettings(Dictionary<string, string> values)
+    {
+        values["monitorResolution"] = resolution.Text;
+        values["monitorFps"] = fps.Value.ToString();
+        values["monitorQuality"] = quality.Text;
+    }
+
+    public void RestoreSettings(Dictionary<string, string> values)
+    {
+        string value;
+        int rate;
+        if (values.TryGetValue("monitorResolution", out value) && resolution.Items.Contains(value)) resolution.SelectedItem = value;
+        if (values.TryGetValue("monitorQuality", out value) && quality.Items.Contains(value)) quality.SelectedItem = value;
+        if (values.TryGetValue("monitorFps", out value) && int.TryParse(value, out rate) && rate >= 1 && rate <= 60) fps.Value = rate;
     }
 
     void Detach()
@@ -146,7 +166,7 @@ sealed class PreviewPane : Panel
 
     void ReadFrame()
     {
-        if (feed == null || (!picture.Visible && sharePicture == null)) return;
+        if (feed == null) return;
         if (feed.ReadLatest(frame)) {
             if (picture.Image == null) {
                 picture.Image = frame;
@@ -159,6 +179,19 @@ sealed class PreviewPane : Panel
                 sharePicture.Invalidate();
             }
             displayed++;
+            if (mobileClock.ElapsedMilliseconds >= 850 && Interlocked.Exchange(ref mobileRequested, 0) != 0) {
+                using (var thumbnail = new Bitmap(320, 180))
+                using (var graphics = Graphics.FromImage(thumbnail))
+                using (var jpeg = new System.IO.MemoryStream()) {
+                    graphics.Clear(Color.Black);
+                    var scale = Math.Min(320.0 / frame.Width, 180.0 / frame.Height);
+                    int width = Math.Max(1, (int)(frame.Width * scale)), height = Math.Max(1, (int)(frame.Height * scale));
+                    graphics.DrawImage(frame, (320 - width) / 2, (180 - height) / 2, width, height);
+                    thumbnail.Save(jpeg, ImageFormat.Jpeg);
+                    mobileImage = jpeg.ToArray();
+                }
+                mobileClock.Restart();
+            }
         }
         if (feed.Disconnected) {
             state.Text = "プレビュー接続が終了しました。";
@@ -177,7 +210,20 @@ sealed class PreviewPane : Panel
         if (sharePicture != null) sharePicture.Image = null;
         if (frame != null) frame.Dispose();
         frame = null;
+        ClearMobile();
         state.Text = "入力を選び、プレビュー開始を押してください。";
+    }
+
+    public byte[] MobileImage()
+    {
+        Interlocked.Exchange(ref mobileRequested, 1);
+        return mobileImage;
+    }
+
+    public void ClearMobile()
+    {
+        Interlocked.Exchange(ref mobileRequested, 0);
+        mobileImage = null;
     }
 
     protected override void Dispose(bool disposing)

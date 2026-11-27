@@ -1,10 +1,15 @@
 [package]
 name = "stream-smash"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "Independent game capture, recording, and streaming"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
 
 [lints.rust]
 unsafe_code = "forbid"

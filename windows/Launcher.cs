@@ -5,9 +5,11 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 sealed class StreamSmashWindow : Form
@@ -40,8 +42,12 @@ sealed class StreamSmashWindow : Form
     readonly Button chooseOverlay = new Button { Text = "PNGを選ぶ", AutoSize = true };
     readonly Button clearOverlay = new Button { Text = "解除", AutoSize = true };
     readonly NumericUpDown opacity = new NumericUpDown { Minimum = 0, Maximum = 100, Value = 100 };
+    readonly TextBox cameraUrl = new TextBox();
+    readonly NumericUpDown volume = new NumericUpDown { Minimum = 0, Maximum = 100, Value = 100 };
+    readonly ProgressBar audioLevel = new ProgressBar { Minimum = 0, Maximum = 60, Width = 108 };
     readonly PreviewPane preview = new PreviewPane();
     readonly Button shareWindow = new Button { Text = "画面共有ウィンドウ", AutoSize = true };
+    readonly Button phone = new Button { Text = "スマホリモコン", AutoSize = true };
     readonly Label resourceUsage = new Label {
         Text = "Stream Smash の CPU・メモリを計測中…", AutoSize = true,
         Padding = new Padding(9, 5, 9, 5), BackColor = StudioColors.Panel
@@ -59,6 +65,13 @@ sealed class StreamSmashWindow : Form
     int closedPipes;
     bool recording, previewing, recordAfterPreview, stopping, closing, highlightPending, hasScanned;
     string latestClip;
+    readonly ConcurrentQueue<string> mobileActions = new ConcurrentQueue<string>();
+    readonly JavaScriptSerializer json = new JavaScriptSerializer();
+    volatile string mobileSnapshot = "{}";
+    string mobileResult = "";
+    MobileRemote mobile;
+    MobilePairing pairing;
+    bool recordWithoutStreaming;
 
     [STAThread]
     static void Main()
@@ -96,9 +109,13 @@ sealed class StreamSmashWindow : Form
         overlayControls.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         AddField(overlayControls, 0, "オーバーレイ PNG", overlay);
         AddField(overlayControls, 1, "不透明度 (%)", opacity);
-        AddWide(overlayControls, 2, Actions(chooseOverlay, clearOverlay));
+        AddField(overlayControls, 2, "サブカメラ URL", cameraUrl);
+        AddField(overlayControls, 3, "録画・配信音量 (%)", volume);
+        AddWide(overlayControls, 4, Actions(chooseOverlay, clearOverlay,
+            new Label { Text = "音声レベル", AutoSize = true, Margin = new Padding(12, 7, 2, 0) }, audioLevel));
+        audioLevel.AccessibleName = "録画・配信音声レベル";
         right.Controls.Add(overlayControls, 0, 1);
-        right.Controls.Add(Actions(shareWindow, resourceUsage), 0, 2);
+        right.Controls.Add(Actions(shareWindow, phone, resourceUsage), 0, 2);
         columns.Panel2.Controls.Add(right);
         var shell = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
         shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
@@ -173,14 +190,10 @@ sealed class StreamSmashWindow : Form
                 if (dialog.ShowDialog(this) == DialogResult.OK) { overlay.Text = dialog.FileName; UpdateControls(); }
         };
         clearOverlay.Click += (sender, args) => { overlay.Clear(); UpdateControls(); };
-        start.Click += (sender, args) => {
-            if (previewing) {
-                recordAfterPreview = true;
-                StopRecording();
-            } else StartCapture(false);
-        };
+        start.Click += (sender, args) => StartRecording(false);
         previewButton.Click += (sender, args) => StartCapture(true);
         shareWindow.Click += (sender, args) => OpenShareWindow();
+        phone.Click += (sender, args) => OpenPhone();
         stop.Click += (sender, args) => StopRecording();
         save.Click += (sender, args) => SaveHighlight();
         openClip.Click += (sender, args) => {
@@ -200,16 +213,170 @@ sealed class StreamSmashWindow : Form
             recordAfterPreview = false;
             StopRecording();
         };
-        FormClosed += (sender, args) => { timer.Dispose(); resourceTimer.Dispose(); };
-        timer.Tick += (sender, args) => ReadActivity();
+        FormClosed += (sender, args) => { RememberSettings(); StopMobile(); timer.Dispose(); resourceTimer.Dispose(); };
+        timer.Tick += (sender, args) => { ReadActivity(); ReadMobileActions(); };
         StudioColors.Apply(this);
         title.ForeColor = StudioColors.Accent;
         StudioColors.Primary(start);
+        RestoreSettings();
         UpdateControls();
         timer.Start();
-        resourceTimer.Tick += (sender, args) => UpdateUsage();
+        resourceTimer.Tick += (sender, args) => { UpdateUsage(); PublishMobile(); };
         UpdateUsage();
         resourceTimer.Start();
+    }
+
+    static string SettingsFile()
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Stream Smash", "settings.json");
+    }
+
+    Dictionary<string, Control> SettingsFields()
+    {
+        return new Dictionary<string, Control> {
+            { "mode", mode }, { "video", source }, { "audio", audio }, { "media", mediaFile },
+            { "capture", captureResolution }, { "preset", videoPreset }, { "resolution", resolution },
+            { "fps", fps }, { "bitrate", bitrate }, { "encoder", encoderChoice }, { "folder", folder },
+            { "clip", buffer }, { "audioPeaks", audioPeaks }, { "livePreview", livePreview },
+            { "overlay", overlay }, { "opacity", opacity }, { "volume", volume }
+        };
+    }
+
+    void RestoreSettings()
+    {
+        try {
+            string path = SettingsFile();
+            if (!File.Exists(path) || new FileInfo(path).Length > 65536) return;
+            var values = json.Deserialize<Dictionary<string, string>>(File.ReadAllText(path));
+            if (values == null) return;
+            var fields = SettingsFields();
+            foreach (string key in new[] { "preset", "mode" }.Concat(fields.Keys.Where(key => key != "preset" && key != "mode"))) {
+                string value;
+                if (!values.TryGetValue(key, out value) || value == null) continue;
+                Control field = fields[key];
+                var number = field as NumericUpDown;
+                var check = field as CheckBox;
+                var list = field as ComboBox;
+                if (number != null) {
+                    decimal parsed;
+                    if (decimal.TryParse(value, out parsed) && parsed >= number.Minimum && parsed <= number.Maximum) number.Value = parsed;
+                } else if (check != null) {
+                    check.Checked = value == "true";
+                } else if (list != null && list.DropDownStyle == ComboBoxStyle.DropDownList) {
+                    if (list.Items.Contains(value)) list.SelectedItem = value;
+                } else field.Text = value;
+            }
+            preview.RestoreSettings(values);
+        } catch (IOException) {
+        } catch (UnauthorizedAccessException) {
+        } catch (ArgumentException) {
+        } catch (InvalidOperationException) {
+        }
+    }
+
+    void RememberSettings()
+    {
+        try {
+            string path = SettingsFile();
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            var values = SettingsFields().ToDictionary(item => item.Key, item => {
+                var check = item.Value as CheckBox;
+                return check == null ? item.Value.Text : check.Checked ? "true" : "false";
+            });
+            preview.StoreSettings(values);
+            string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try {
+                File.WriteAllText(temporary, json.Serialize(values));
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
+            } finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        } catch (IOException) {
+        } catch (UnauthorizedAccessException) {
+        }
+    }
+
+    void StartRecording(bool withoutStreaming)
+    {
+        recordWithoutStreaming = withoutStreaming;
+        if (previewing) {
+            recordAfterPreview = true;
+            StopRecording();
+        } else StartCapture(false);
+    }
+
+    void OpenPhone()
+    {
+        if (pairing != null) { pairing.Activate(); return; }
+        pairing = new MobilePairing(ip => {
+            StopMobile();
+            var assembly = typeof(StreamSmashWindow).Assembly;
+            using (var file = assembly.GetManifestResourceStream("StreamSmash.Mobile"))
+            using (var body = new MemoryStream()) {
+                file.CopyTo(body);
+                mobile = new MobileRemote(ip, body.ToArray(), mobileActions.Enqueue,
+                    () => mobileSnapshot, preview.MobileImage);
+            }
+            PublishMobile();
+            return mobile;
+        }, StopMobile);
+        pairing.FormClosed += (sender, args) => pairing = null;
+        pairing.Show(this);
+    }
+
+    void StopMobile()
+    {
+        if (mobile != null) mobile.Dispose();
+        mobile = null;
+        mobileResult = "";
+        preview.ClearMobile();
+        string ignored;
+        while (mobileActions.TryDequeue(out ignored)) { }
+    }
+
+    List<string> AvailableMobileActions()
+    {
+        var actions = new List<string>();
+        if (closing || stopping) return actions;
+        if (previewButton.Enabled) actions.Add("/preview-start");
+        if (start.Enabled) {
+            actions.Add("/record");
+            if (!string.IsNullOrWhiteSpace(rtmp.Text)) actions.Add("/stream");
+        }
+        if (stop.Enabled) actions.Add("/stop");
+        if (save.Enabled) actions.Add("/clip");
+        return actions;
+    }
+
+    void PublishMobile()
+    {
+        if (mobile == null) return;
+        mobileSnapshot = json.Serialize(new {
+            state = status.Text,
+            metrics = resourceUsage.Text,
+            result = mobileResult,
+            actions = AvailableMobileActions()
+        });
+    }
+
+    void ReadMobileActions()
+    {
+        if (mobile == null) return;
+        string action;
+        while (mobileActions.TryDequeue(out action)) {
+            if (!AvailableMobileActions().Contains(action)) {
+                mobileResult = "現在の状態では実行できません。";
+                continue;
+            }
+            mobileResult = "";
+            switch (action) {
+                case "/preview-start": StartCapture(true); break;
+                case "/record": StartRecording(true); break;
+                case "/stream": StartRecording(false); break;
+                case "/stop": StopRecording(); break;
+                case "/clip": SaveHighlight(); break;
+            }
+        }
     }
 
     void UpdateUsage()
@@ -277,6 +444,8 @@ sealed class StreamSmashWindow : Form
         save.Enabled = stop.Enabled && recording && buffer.SelectedIndex > 0 && !highlightPending;
         audioPeaks.Enabled = idle && buffer.SelectedIndex > 0;
         chooseOverlay.Enabled = idle;
+        cameraUrl.Enabled = idle;
+        volume.Enabled = idle;
         clearOverlay.Enabled = opacity.Enabled = idle && overlay.Text.Length > 0;
         preview.SettingsEnabled = idle;
     }
@@ -312,10 +481,13 @@ sealed class StreamSmashWindow : Form
             args.AddRange(new[] { "--highlights", lengths[buffer.SelectedIndex] });
             if (audioPeaks.Checked) args.Add("--audio-peaks");
         }
-        string destination = onlyPreview ? "" : rtmp.Text.Trim();
+        if (!onlyPreview) args.AddRange(new[] { "--audio-volume", volume.Value.ToString(), "--audio-meter" });
+        string destination = onlyPreview || recordWithoutStreaming ? "" : rtmp.Text.Trim();
         if (destination.Length > 0) args.Add("--stream");
         if (overlay.Text.Length > 0)
             args.AddRange(new[] { "--overlay", overlay.Text, "--overlay-opacity", opacity.Value.ToString() });
+        if (!string.IsNullOrWhiteSpace(cameraUrl.Text))
+            args.AddRange(new[] { "--camera-url", cameraUrl.Text.Trim() });
         if (onlyPreview || livePreview.Checked) {
             try {
                 preview.Begin();
@@ -402,6 +574,13 @@ sealed class StreamSmashWindow : Form
         if (engine == null) return;
         string line;
         while (messages.TryDequeue(out line)) {
+            if (line.StartsWith("Audio level: ", StringComparison.Ordinal)) {
+                double level;
+                if (double.TryParse(line.Substring("Audio level: ".Length), NumberStyles.Float,
+                    CultureInfo.InvariantCulture, out level))
+                    audioLevel.Value = (int)Math.Max(0, Math.Min(60, level + 60));
+                continue;
+            }
             if (!recording && (line.StartsWith("video\t") || line.StartsWith("audio\t"))) {
                 var choices = line.StartsWith("video\t") ? source : audio;
                 choices.Items.Add(line.Substring(6));
@@ -414,10 +593,12 @@ sealed class StreamSmashWindow : Form
                 clipStatus.Text = (manualClip ? "見せ場を保存しました　" : "音の盛り上がりを自動保存しました　") + name;
                 openClip.Enabled = true;
                 if (manualClip) highlightPending = false;
+                mobileResult = "見せ場を保存しました。";
                 UpdateControls();
             } else if (line.StartsWith("Highlight unavailable: ")) {
                 clipStatus.Text = "クリップを保存できませんでした。詳細はログを確認してください。";
                 highlightPending = false;
+                mobileResult = "見せ場の保存に失敗しました。";
                 UpdateControls();
             }
             if (line.StartsWith("Encoder: ", StringComparison.Ordinal))
@@ -443,6 +624,7 @@ sealed class StreamSmashWindow : Form
             : "処理に失敗しました。詳細はログを確認してください。";
         engine.Dispose();
         engine = null;
+        audioLevel.Value = 0;
         previewing = false;
         recordAfterPreview = false;
         if (wasCapture) preview.End();
